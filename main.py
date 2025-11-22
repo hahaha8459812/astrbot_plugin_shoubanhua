@@ -24,7 +24,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "通过第三方api进行手办化等功能",
-    "1.4.1", 
+    "1.4.2", 
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -37,7 +37,7 @@ class FigurineProPlugin(Star):
         async def _download_image(self, url: str) -> bytes | None:
             logger.info(f"正在尝试下载图片: {url}")
             try:
-                async with self.session.get(url, proxy=self.proxy, timeout=30) as resp:
+                async with self.session.get(url, proxy=self.proxy, timeout=120) as resp:
                     resp.raise_for_status()
                     return await resp.read()
             except aiohttp.ClientResponseError as e:
@@ -324,6 +324,8 @@ class FigurineProPlugin(Star):
                 break
         if not found: prompt_list.append(f"{key}:{new_value}")
 
+        # FIX: 修复 NoneType object is not callable
+        # 使用字典赋值，并手动调用 save()
         self.conf["prompt_list"] = prompt_list
         try:
             if hasattr(self.conf, "save"):
@@ -526,7 +528,7 @@ class FigurineProPlugin(Star):
         added_keys = [key for key in new_keys if key not in api_keys]
         api_keys.extend(added_keys)
         
-        # FIX: 直接赋值并尝试保存
+        # FIX: 同样的配置保存修复
         self.conf["api_keys"] = api_keys
         try:
             if hasattr(self.conf, "save"): self.conf.save()
@@ -619,9 +621,10 @@ class FigurineProPlugin(Star):
 
         try:
             if not self.iwf: return "ImageWorkflow 未初始化"
+            # FIX: 使用独立的 Session，避免 ServerDisconnectedError
             async with aiohttp.ClientSession() as session:
                 async with session.post(api_url, json=payload, headers=headers, proxy=self.iwf.proxy,
-                                            timeout=180) as resp:
+                                            timeout=120) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
                         logger.error(f"API 请求失败: HTTP {resp.status}, 响应: {error_text}")
@@ -637,7 +640,6 @@ class FigurineProPlugin(Star):
                         b64_data = gen_image_url.split(",", 1)[1]
                         return base64.b64decode(b64_data)
                     else:
-
                         return await self.iwf._download_image(gen_image_url) or "下载生成的图片失败"
         except asyncio.TimeoutError:
             logger.error("API 请求超时");
