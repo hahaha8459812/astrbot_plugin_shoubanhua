@@ -24,7 +24,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "通过第三方api进行手办化等功能",
-    "1.4.0", 
+    "1.4.1", 
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -259,7 +259,6 @@ class FigurineProPlugin(Star):
         group_id = event.get_group_id()
         is_master = self.is_global_admin(event)
 
-        # --- 权限和次数检查 ---
         if not is_master:
             if sender_id in self.conf.get("user_blacklist", []): return
             if group_id and group_id in self.conf.get("group_blacklist", []): return
@@ -284,13 +283,11 @@ class FigurineProPlugin(Star):
         yield event.plain_result(f"🎨 收到文生图请求，正在生成 [{display_prompt}]...")
 
         start_time = datetime.now()
-        # 调用通用API，但传入空的图片列表
         res = await self._call_api([], prompt)
         elapsed = (datetime.now() - start_time).total_seconds()
 
         if isinstance(res, bytes):
             if not is_master:
-                # 扣除次数
                 if self.conf.get("enable_group_limit", False) and group_id and self._get_group_count(group_id) > 0:
                     await self._decrease_group_count(group_id)
                 elif self.conf.get("enable_user_limit", True) and self._get_user_count(sender_id) > 0:
@@ -327,26 +324,41 @@ class FigurineProPlugin(Star):
                 break
         if not found: prompt_list.append(f"{key}:{new_value}")
 
-        await self.conf.set("prompt_list", prompt_list)
+        self.conf["prompt_list"] = prompt_list
+        try:
+            if hasattr(self.conf, "save"):
+                self.conf.save()
+            elif hasattr(self.context, "save_config"):
+                await self.context.save_config()
+        except Exception as e:
+            logger.warning(f"保存配置时遇到非致命错误: {e}")
+        
         await self._load_prompt_map()
         yield event.plain_result(f"已保存LM生图提示语:\n{key}:{new_value}")
 
     @filter.command("lm帮助", aliases={"lmh", "手办化帮助"}, prefix_optional=True)
     async def on_prompt_help(self, event: AstrMessageEvent):
         keyword = event.message_str.strip()
+        
+        # 如果 keyword 为空，列出所有指令
         if not keyword:
-            msg = "图生图预设指令: \n"
-            msg += "、".join(self.prompt_map.keys())
-            msg += "\n\n纯文本生图指令: \n#文生图 <你的描述>"
-            msg += "\n\n发送图片 + 预设指令 或 @用户 + 预设指令 来进行图生图。"
+            keys = sorted(list(self.prompt_map.keys()))
+            msg = "🎨 图生图预设指令列表:\n"
+            if keys:
+                msg += "、".join(keys)
+            else:
+                msg += "(暂无预设)"
+            msg += "\n\n📝 使用说明:\n1. 发送 [图片] + [指令名]\n2. 引用图片 + [指令名]\n3. @机器人 + [指令名]\n4. #文生图 <描述>"
+            msg += "\n\n🔍 查询具体指令内容:\n#lm帮助 <指令名>"
             yield event.plain_result(msg)
             return
 
+        # 查找特定指令
         prompt = self.prompt_map.get(keyword)
-        if not prompt:
-            yield event.plain_result("未找到此预设指令")
-            return
-        yield event.plain_result(f"预设 [{keyword}] 的内容:\n{prompt}")
+        if prompt:
+            yield event.plain_result(f"📄 预设 [{keyword}] 的提示词:\n{prompt}")
+        else:
+            yield event.plain_result(f"❌ 未找到指令 [{keyword}] 的配置。\n请发送 #lm帮助 查看可用列表。")
 
     def is_global_admin(self, event: AstrMessageEvent) -> bool:
         admin_ids = self.context.get_config().get("admins_id", [])
@@ -513,7 +525,13 @@ class FigurineProPlugin(Star):
         api_keys = self.conf.get("api_keys", [])
         added_keys = [key for key in new_keys if key not in api_keys]
         api_keys.extend(added_keys)
-        await self.conf.set("api_keys", api_keys)
+        
+        # FIX: 直接赋值并尝试保存
+        self.conf["api_keys"] = api_keys
+        try:
+            if hasattr(self.conf, "save"): self.conf.save()
+        except: pass
+        
         yield event.plain_result(f"✅ 操作完成，新增 {len(added_keys)} 个Key，当前共 {len(api_keys)} 个。")
 
     @filter.command("手办化key列表", prefix_optional=True)
@@ -530,11 +548,17 @@ class FigurineProPlugin(Star):
         param = event.message_str.strip()
         api_keys = self.conf.get("api_keys", [])
         if param.lower() == "all":
-            await self.conf.set("api_keys", [])
+            self.conf["api_keys"] = []
+            try:
+                if hasattr(self.conf, "save"): self.conf.save()
+            except: pass
             yield event.plain_result(f"✅ 已删除全部 {len(api_keys)} 个 Key。")
         elif param.isdigit() and 1 <= int(param) <= len(api_keys):
             removed_key = api_keys.pop(int(param) - 1)
-            await self.conf.set("api_keys", api_keys)
+            self.conf["api_keys"] = api_keys
+            try:
+                if hasattr(self.conf, "save"): self.conf.save()
+            except: pass
             yield event.plain_result(f"✅ 已删除 Key: {removed_key[:8]}...")
         else:
             yield event.plain_result("格式错误，请使用 #手办化删除key <序号|all>")
@@ -574,15 +598,17 @@ class FigurineProPlugin(Star):
         if not api_url: return "API URL 未配置"
         api_key = await self._get_api_key()
         if not api_key: return "无可用的 API Key"
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Connection": "close"
+        }
 
-        # --- 构建 content 列表 ---
         content = [{"type": "text", "text": prompt}]
         for image_bytes in image_bytes_list:
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}})
 
-        # --- 从配置读取模型名称 ---
         model_name = self.conf.get("model", "nano-banana")
         payload = {
             "model": model_name,
@@ -593,24 +619,26 @@ class FigurineProPlugin(Star):
 
         try:
             if not self.iwf: return "ImageWorkflow 未初始化"
-            async with self.iwf.session.post(api_url, json=payload, headers=headers, proxy=self.iwf.proxy,
-                                             timeout=120) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"API 请求失败: HTTP {resp.status}, 响应: {error_text}")
-                    return f"API请求失败 (HTTP {resp.status}): {error_text[:200]}"
-                data = await resp.json()
-                if "error" in data: return data["error"].get("message", json.dumps(data["error"]))
-                gen_image_url = self._extract_image_url_from_response(data)
-                if not gen_image_url:
-                    error_msg = f"API响应中未找到图片数据: {str(data)[:500]}..."
-                    logger.error(f"API响应中未找到图片数据: {data}")
-                    return error_msg
-                if gen_image_url.startswith("data:image/"):
-                    b64_data = gen_image_url.split(",", 1)[1]
-                    return base64.b64decode(b64_data)
-                else:
-                    return await self.iwf._download_image(gen_image_url) or "下载生成的图片失败"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_url, json=payload, headers=headers, proxy=self.iwf.proxy,
+                                            timeout=180) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(f"API 请求失败: HTTP {resp.status}, 响应: {error_text}")
+                        return f"API请求失败 (HTTP {resp.status}): {error_text[:200]}"
+                    data = await resp.json()
+                    if "error" in data: return data["error"].get("message", json.dumps(data["error"]))
+                    gen_image_url = self._extract_image_url_from_response(data)
+                    if not gen_image_url:
+                        error_msg = f"API响应中未找到图片数据: {str(data)[:500]}..."
+                        logger.error(f"API响应中未找到图片数据: {data}")
+                        return error_msg
+                    if gen_image_url.startswith("data:image/"):
+                        b64_data = gen_image_url.split(",", 1)[1]
+                        return base64.b64decode(b64_data)
+                    else:
+
+                        return await self.iwf._download_image(gen_image_url) or "下载生成的图片失败"
         except asyncio.TimeoutError:
             logger.error("API 请求超时");
             return "请求超时"
