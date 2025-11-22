@@ -1,15 +1,15 @@
 {
     "api_url": {
-        "description": "【通用】API的URL地址",
+        "description": "API的URL地址",
         "type": "string",
         "hint": "图生图和文生图功能均使用此URL。默认为 https://api.bltcy.ai/v1/chat/completions",
         "default": "https://api.bltcy.ai/v1/chat/completions"
     },
     "model": {
-        "description": "【通用】默认模型名称",
+        "description": "默认模型名称",
         "type": "string",
-        "hint": "图生图和文生图功能均使用此模型。默认为 nano-banana",
-        "default": "nano-banana"
+        "hint": "图生图和文生图功能均使用此模型。默认为 gemini-2.5-flash-image-preview",
+        "default": "gemini-2.5-flash-image-preview"
     },
     "api_keys": {
         "description": "API 密钥列表",
@@ -22,7 +22,7 @@
         "default": []
     },
     "prefix": {
-        "description": "【重要】是否要求指令必须带前缀",
+        "description": "是否要求指令必须带前缀",
         "type": "bool",
         "hint": "推荐开启。开启后，指令需要前缀（如 '#'）或 @机器人 才能触发，可避免日常聊天误触。",
         "default": true
@@ -159,3 +159,4 @@
         ]
     }
 }
+
