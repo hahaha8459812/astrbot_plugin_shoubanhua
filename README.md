@@ -1,4 +1,5 @@
 # 拉爆了，支持gemini官方api
+大更新晚点写文档，一定要看
 # 通过第三方柏拉图api调用 Banana的api使用
 注册地址 [柏拉图1]( https://api.bltcy.ai/register?aff=dcc39044557)
 # 原先bnn涨价原因
