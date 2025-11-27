@@ -34,7 +34,7 @@ PRESET_MODELS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "Google Gemini 手办化/图生图插件",
-    "1.6.0",
+    "1.6.1",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -218,6 +218,12 @@ class FigurineProPlugin(Star):
 
     def is_global_admin(self, event: AstrMessageEvent) -> bool:
         return event.get_sender_id() in self.context.get_config().get("admins_id", [])
+
+    def _norm_id(self, raw_id: Any) -> str:
+        """标准化 ID 为去除空白的字符串"""
+        if raw_id is None:
+            return ""
+        return str(raw_id).strip()
 
     @filter.command("切换API模式", aliases={"SwitchApi"}, prefix_optional=True)
     async def on_switch_api_mode(self, event: AstrMessageEvent):
@@ -565,7 +571,6 @@ class FigurineProPlugin(Star):
             if cmd in cmd_map:
                 key = cmd_map[cmd]
                 if key == "help":
-                    # 修复：直接 yield 结果，不再使用 await
                     yield self._get_help_result(event)
                     return
                 user_prompt = self.prompt_map.get(key)
@@ -577,39 +582,66 @@ class FigurineProPlugin(Star):
             yield event.plain_result(f"❌ 指令 '{cmd}' 未配置提示词。")
             return
 
-        sender_id = event.get_sender_id()
-        group_id = event.get_group_id()
+        # --- 权限与次数逻辑 ---
+        sender_id = self._norm_id(event.get_sender_id())
+        group_id = self._norm_id(event.get_group_id()) if event.get_group_id() else None
+        
+        # 1. 黑名单检查
+        user_blacklist = [self._norm_id(x) for x in (self.conf.get("user_blacklist") or [])]
+        if sender_id in user_blacklist: return
+        
+        if group_id:
+            group_blacklist = [self._norm_id(x) for x in (self.conf.get("group_blacklist") or [])]
+            if group_id in group_blacklist: return
+
+        # 2. 白名单逻辑
+        raw_g_whitelist = self.conf.get("group_whitelist") or []
+        group_whitelist = [self._norm_id(x) for x in raw_g_whitelist]
+        
+        raw_u_whitelist = self.conf.get("user_whitelist") or []
+        user_whitelist = [self._norm_id(x) for x in raw_u_whitelist]
+        
         is_master = self.is_global_admin(event)
-
-        if sender_id in self.conf.get("user_blacklist", []): return
-        if group_id and group_id in self.conf.get("group_blacklist", []): return
-
-        group_whitelist = self.conf.get("group_whitelist", [])
-        is_in_whitelist = group_id and group_id in group_whitelist
-        is_whitelist_strict_mode = len(group_whitelist) > 0
-
-        skip_deduction = False
+        deduction_source = None 
 
         if is_master:
-            skip_deduction = True
-        elif is_in_whitelist:
-            skip_deduction = True
-        elif is_whitelist_strict_mode and group_id:
+            deduction_source = 'free'
+        elif group_id and group_id in group_whitelist:
+            deduction_source = 'free' # 群白名单 -> 无限
+        elif group_id and len(group_whitelist) > 0:
+            # 严格模式：不在白名单群 -> 禁止
             yield event.plain_result("❌ 本群未授权使用此功能。")
             return
-        elif self.conf.get("user_whitelist", []) and sender_id not in self.conf.get("user_whitelist", []):
+        elif len(user_whitelist) > 0 and sender_id not in user_whitelist:
             return
 
-        if not skip_deduction:
+        if deduction_source is None:
+            # 优先扣除群组
             if group_id and self.conf.get("enable_group_limit", False):
-                if self._get_group_count(group_id) <= 0:
-                    yield event.plain_result("❌ 本群的生成次数已用尽。")
-                    return
-            if self.conf.get("enable_user_limit", True):
-                if self._get_user_count(sender_id) <= 0:
-                    yield event.plain_result("❌ 您的使用次数已用完。")
+                g_cnt = self._get_group_count(group_id)
+                if g_cnt > 0:
+                    deduction_source = 'group'
+            
+            # 如果群组没次数（或未扣除群组），尝试扣除个人
+            if deduction_source is None and self.conf.get("enable_user_limit", True):
+                u_cnt = self._get_user_count(sender_id)
+                if u_cnt > 0:
+                    deduction_source = 'user'
+            
+            # 再次检查：是否两者都未开启限制？如果是，则免费
+            if deduction_source is None:
+                if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
+                    deduction_source = 'free'
+                else:
+                    msg = "❌ 次数不足。"
+                    if group_id and self.conf.get("enable_group_limit", False):
+                         msg = "❌ 本群或您的使用次数已用尽 (优先扣除群次数)。"
+                    else:
+                         msg = "❌ 您的使用次数已用完。"
+                    yield event.plain_result(msg)
                     return
 
+        # --- 图片获取 ---
         if not self.iwf or not (img_bytes_list := await self.iwf.get_images(event)):
             if not is_bnn:
                 yield event.plain_result("请发送或引用一张图片。")
@@ -639,11 +671,11 @@ class FigurineProPlugin(Star):
 
         yield event.plain_result(f"🎨 收到请求，正在生成 [{display_cmd}]...")
 
-        if not skip_deduction:
-            if group_id and self.conf.get("enable_group_limit", False):
-                await self._decrease_group_count(group_id)
-            if self.conf.get("enable_user_limit", True):
-                await self._decrease_user_count(sender_id)
+        # --- 扣费执行 ---
+        if deduction_source == 'group':
+            await self._decrease_group_count(group_id)
+        elif deduction_source == 'user':
+            await self._decrease_user_count(sender_id)
 
         start_time = datetime.now()
         res = await self._call_api(images_to_process, user_prompt, override_model=override_model_name)
@@ -653,18 +685,21 @@ class FigurineProPlugin(Star):
             await self._record_daily_usage(sender_id, group_id)
             
             caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)", f"预设: {display_cmd}"]
-            if skip_deduction:
+            
+            if deduction_source == 'free':
                 caption_parts.append("剩余: ∞")
             else:
-                if self.conf.get("enable_user_limit", True):
-                    caption_parts.append(f"个人: {self._get_user_count(sender_id)}")
+                # 无论扣除的是谁，只要开启了限制，就显示对应的剩余次数
                 if group_id and self.conf.get("enable_group_limit", False):
-                    caption_parts.append(f"本群: {self._get_group_count(group_id)}")
+                    caption_parts.append(f"本群剩余: {self._get_group_count(group_id)}")
+                
+                if self.conf.get("enable_user_limit", True):
+                    caption_parts.append(f"用户剩余: {self._get_user_count(sender_id)}")
 
             yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
         else:
             msg = f"❌ 生成失败 ({elapsed:.2f}s)\n原因: {res}"
-            if not skip_deduction:
+            if deduction_source in ['group', 'user']:
                 msg += "\n(注: 触发即扣次)"
             yield event.plain_result(msg)
 
@@ -685,7 +720,7 @@ class FigurineProPlugin(Star):
 
         node = Node(
             name="手办化助手",
-            uin=str(bot_uin), # 强制转str，防止Pydantic校验失败
+            uin=str(bot_uin),
             content=[Plain(help_text)]
         )
         return event.chain_result([Nodes(nodes=[node])])
@@ -711,27 +746,45 @@ class FigurineProPlugin(Star):
             yield event.plain_result("请提供描述。用法: #文生图 [可选:(序号)] <描述>")
             return
 
-        sender_id = event.get_sender_id()
-        if not self.is_global_admin(event):
-             if self.conf.get("enable_user_limit", True) and self._get_user_count(sender_id) <= 0:
-                yield event.plain_result("❌ 您的使用次数已用完。")
-                return
+        sender_id = self._norm_id(event.get_sender_id())
+        group_id = self._norm_id(event.get_group_id()) if event.get_group_id() else None
+
+        # --- 权限逻辑复用 ---
+        deduction_source = None
+        if self.is_global_admin(event):
+            deduction_source = 'free'
+        else:
+            if group_id and self.conf.get("enable_group_limit", False):
+                if self._get_group_count(group_id) > 0:
+                    deduction_source = 'group'
+            
+            if deduction_source is None and self.conf.get("enable_user_limit", True):
+                if self._get_user_count(sender_id) > 0:
+                    deduction_source = 'user'
+            
+            if deduction_source is None:
+                if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
+                    deduction_source = 'free'
+                else:
+                    yield event.plain_result("❌ 您的使用次数已用完。")
+                    return
 
         info_str = f"🎨 收到文生图请求，正在生成 [{prompt[:10]}...]"
         if override_model_name:
             info_str += f" (模型: {override_model_name})"
         yield event.plain_result(info_str)
 
-        if not self.is_global_admin(event):
-             if self.conf.get("enable_user_limit", True):
-                await self._decrease_user_count(sender_id)
+        if deduction_source == 'group':
+            await self._decrease_group_count(group_id)
+        elif deduction_source == 'user':
+            await self._decrease_user_count(sender_id)
 
         start_time = datetime.now()
         res = await self._call_api([], prompt, override_model=override_model_name)
         elapsed = (datetime.now() - start_time).total_seconds()
 
         if isinstance(res, bytes):
-            await self._record_daily_usage(sender_id, event.get_group_id())
+            await self._record_daily_usage(sender_id, group_id)
             yield event.chain_result([Image.fromBytes(res), Plain(f"✅ 生成成功 ({elapsed:.2f}s)")])
         else:
             yield event.plain_result(f"❌ 生成失败: {res}")
@@ -837,14 +890,12 @@ class FigurineProPlugin(Star):
         keyword = parts[1] if len(parts) > 1 else ""
 
         if not keyword:
-            # 修复：直接 yield 结果，不再使用 await
             yield self._get_help_result(event)
             return
 
         prompt = self.prompt_map.get(keyword)
         content = f"📄 预设 [{keyword}] 内容:\n{prompt}" if prompt else f"❌ 未找到 [{keyword}]"
         
-        # Pydantic 类型兼容处理
         bot_uin = "2854196310"
         try:
             if hasattr(event, "robot") and event.robot:
@@ -881,12 +932,13 @@ class FigurineProPlugin(Star):
             pass
 
     def _get_user_count(self, uid: str) -> int:
-        return self.user_counts.get(str(uid), 0)
+        return self.user_counts.get(self._norm_id(uid), 0)
 
     async def _decrease_user_count(self, uid: str):
+        uid = self._norm_id(uid)
         count = self._get_user_count(uid)
         if count > 0:
-            self.user_counts[str(uid)] = count - 1
+            self.user_counts[uid] = count - 1
             await self._save_user_counts()
 
     async def _load_group_counts(self):
@@ -907,12 +959,13 @@ class FigurineProPlugin(Star):
             pass
 
     def _get_group_count(self, group_id: str) -> int:
-        return self.group_counts.get(str(group_id), 0)
+        return self.group_counts.get(self._norm_id(group_id), 0)
 
     async def _decrease_group_count(self, group_id: str):
-        count = self._get_group_count(group_id)
+        gid = self._norm_id(group_id)
+        count = self._get_group_count(gid)
         if count > 0:
-            self.group_counts[str(group_id)] = count - 1
+            self.group_counts[gid] = count - 1
             await self._save_group_counts()
 
     async def _load_user_checkin_data(self):
@@ -959,12 +1012,12 @@ class FigurineProPlugin(Star):
                 "groups": {}
             }
         
-        uid = str(user_id)
+        uid = self._norm_id(user_id)
         current_u = self.daily_stats["users"].get(uid, 0)
         self.daily_stats["users"][uid] = current_u + 1
         
         if group_id:
-            gid = str(group_id)
+            gid = self._norm_id(group_id)
             current_g = self.daily_stats["groups"].get(gid, 0)
             self.daily_stats["groups"][gid] = current_g + 1
             
@@ -1008,7 +1061,7 @@ class FigurineProPlugin(Star):
             yield event.plain_result("📅 签到未开启。")
             return
 
-        uid = event.get_sender_id()
+        uid = self._norm_id(event.get_sender_id())
         today = datetime.now().strftime("%Y-%m-%d")
 
         if self.user_checkin_data.get(uid) == today:
@@ -1037,19 +1090,28 @@ class FigurineProPlugin(Star):
         target, count = None, 0
 
         if at_seg:
-            target = str(at_seg.qq)
+            target = self._norm_id(at_seg.qq)
             match = re.search(r"(\d+)\s*$", text)
             if match:
                 count = int(match.group(1))
         else:
             match = re.search(r"(\d+)\s+(\d+)", text)
             if match:
-                target, count = match.group(1), int(match.group(2))
+                target, count = self._norm_id(match.group(1)), int(match.group(2))
 
         if target:
-            self.user_counts[str(target)] = self._get_user_count(target) + count
+            old_cnt = self._get_user_count(target)
+            new_cnt = old_cnt + count
+            self.user_counts[target] = new_cnt
             await self._save_user_counts()
-            yield event.plain_result(f"✅ 已为 {target} 增加 {count} 次。")
+            
+            msg = f"✅ 已为用户 {target} 增加 {count} 次。\n"
+            msg += f"📊 变动: {old_cnt} + {count} = {new_cnt}\n"
+            msg += f"👤 用户剩余: {new_cnt}"
+            if gid := event.get_group_id():
+                msg += f"\n👥 本群剩余: {self._get_group_count(self._norm_id(gid))}"
+            
+            yield event.plain_result(msg)
 
     @filter.command("手办化增加群组次数", prefix_optional=True)
     async def on_add_group_counts(self, event: AstrMessageEvent):
@@ -1058,26 +1120,35 @@ class FigurineProPlugin(Star):
 
         match = re.search(r"(\d+)\s+(\d+)", event.message_str.strip())
         if match:
-            gid, count = match.group(1), int(match.group(2))
-            self.group_counts[str(gid)] = self._get_group_count(gid) + count
+            gid, count = self._norm_id(match.group(1)), int(match.group(2))
+            
+            old_cnt = self._get_group_count(gid)
+            new_cnt = old_cnt + count
+            self.group_counts[gid] = new_cnt
             await self._save_group_counts()
-            yield event.plain_result(f"✅ 已为群 {gid} 增加 {count} 次。")
+            
+            msg = f"✅ 已为群 {gid} 增加 {count} 次。\n"
+            msg += f"📊 变动: {old_cnt} + {count} = {new_cnt}\n"
+            msg += f"👥 本群剩余: {new_cnt}"
+            
+            yield event.plain_result(msg)
 
     @filter.command("手办化查询次数", prefix_optional=True)
     async def on_query_counts(self, event: AstrMessageEvent):
-        uid = event.get_sender_id()
+        uid = self._norm_id(event.get_sender_id())
+        
         if self.is_global_admin(event):
             at_seg = next((s for s in event.message_obj.message if isinstance(s, At)), None)
             if at_seg:
-                uid = str(at_seg.qq)
+                uid = self._norm_id(at_seg.qq)
             else:
                 match = re.search(r"(\d+)", event.message_str)
                 if match:
-                    uid = match.group(1)
+                    uid = self._norm_id(match.group(1))
 
         msg = f"👤 用户 {uid} 剩余: {self._get_user_count(uid)}"
         if gid := event.get_group_id():
-            msg += f"\n👥 本群剩余: {self._get_group_count(gid)}"
+            msg += f"\n👥 本群剩余: {self._get_group_count(self._norm_id(gid))}"
 
         yield event.plain_result(msg)
 
@@ -1091,7 +1162,6 @@ class FigurineProPlugin(Star):
             yield event.plain_result("格式错误。用法: #手办化添加key <key1> ...")
             return
 
-        # 获取当前模式，添加到对应池子
         current_mode = self.conf.get("api_mode", "generic")
         target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
         
@@ -1151,4 +1221,3 @@ class FigurineProPlugin(Star):
         if self.iwf:
             await self.iwf.terminate()
         logger.info("[FigurinePro] 插件已终止")
-
