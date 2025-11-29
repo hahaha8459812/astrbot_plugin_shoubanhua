@@ -34,7 +34,7 @@ PRESET_MODELS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "Google Gemini 手办化/图生图插件",
-    "1.6.2",
+    "1.6.3",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -329,6 +329,7 @@ class FigurineProPlugin(Star):
                 return key
 
     def _extract_image_url_from_response(self, data: Dict[str, Any]) -> str | None:
+        # 1. Google Gemini Official Structure
         try:
             if "candidates" in data:
                 parts = data["candidates"][0]["content"]["parts"]
@@ -342,11 +343,25 @@ class FigurineProPlugin(Star):
         except:
             pass
 
+        # 2. OpenAI-style Image Generation Structure (DALL-E format) - [新增修复]
+        try:
+            if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+                item = data["data"][0]
+                if "b64_json" in item:
+                    # 返回 Data URI 格式，以便 _call_api 识别为 base64
+                    return f"data:image/png;base64,{item['b64_json']}"
+                if "url" in item:
+                    return item["url"]
+        except:
+            pass
+
+        # 3. OpenAI-style Chat Completion Structure (Custom providers)
         try:
             return data["choices"][0]["message"]["images"][0]["image_url"]["url"]
         except:
             pass
 
+        # 4. OpenAI-style Chat Completion (URL in content text)
         try:
             if "choices" in data:
                 content = data["choices"][0]["message"]["content"]
@@ -757,35 +772,22 @@ class FigurineProPlugin(Star):
 
         # --- 权限逻辑复用 ---
         deduction_source = None
-        is_master = self.is_global_admin(event)
-        
-        # 简单白名单逻辑复用(如果不复用全部逻辑，至少复用Master免费)
-        if is_master:
+        if self.is_global_admin(event):
             deduction_source = 'free'
-        
-        # 如果不是Master，执行常规扣费检查
-        if deduction_source is None:
-            # 优先扣除群组
+        else:
             if group_id and self.conf.get("enable_group_limit", False):
                 if self._get_group_count(group_id) > 0:
                     deduction_source = 'group'
             
-            # 其次扣除个人
             if deduction_source is None and self.conf.get("enable_user_limit", True):
                 if self._get_user_count(sender_id) > 0:
                     deduction_source = 'user'
             
-            # 都没开启限制 -> 免费
             if deduction_source is None:
                 if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
                     deduction_source = 'free'
                 else:
-                    msg = "❌ 次数不足。"
-                    if group_id and self.conf.get("enable_group_limit", False):
-                         msg = "❌ 本群或您的使用次数已用尽 (文生图优先扣除群次数)。"
-                    else:
-                         msg = "❌ 您的使用次数已用完。"
-                    yield event.plain_result(msg)
+                    yield event.plain_result("❌ 您的使用次数已用完。")
                     return
 
         info_str = f"🎨 收到文生图请求，正在生成 [{prompt[:10]}...]"
