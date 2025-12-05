@@ -42,6 +42,7 @@
 | `power_model_tip_enabled` | 是否在普通模式回复里提醒强力模式格式和扣费 |
 | `power_model_extra_cost` | 强力模式额外扣次数（基础 1 次+额外值） |
 | `show_model_info` | 是否在成功/失败消息中显示实际调用模型 |
+| `debug_mode` | 调试模式，开启后报错会附加完整错误内容 |
 | `prefix` | 是否需要命令前缀或 @ 才触发 |
 | `extra_prefix` | 自定义提示词前缀（如 bnn，用 bnn <prompt> 调用） |
 | `use_proxy` / `proxy_url` | 启用代理与代理地址 |
