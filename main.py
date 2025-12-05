@@ -373,11 +373,58 @@ class FigurineProPlugin(Star):
 
         return None
 
+    def _build_limit_exhausted_message(
+        self,
+        group_id: Optional[str],
+        use_power_mode: bool = False,
+        required_cost: int = 1,
+    ) -> str:
+        """构造次数耗尽时的提示文案"""
+        if group_id and self.conf.get("enable_group_limit", False):
+            msg = "❌ 本群或您的使用次数已用尽 (优先扣除群次数)。"
+        else:
+            msg = "❌ 您的使用次数已用完。"
+
+        extra_cost = max(0, required_cost - 1)
+        if use_power_mode and extra_cost > 0:
+            msg += f"\n⚙️ 强力模式每次额外扣除 {extra_cost} 次。"
+
+        if self.conf.get("enable_checkin", False) and self.conf.get("enable_user_limit", True):
+            msg += "\n📅 发送 \"手办化签到\" 指令（请按当前命令前缀或唤醒方式触发）可补充个人次数。"
+
+        return msg
+
+    def _get_required_invocation_cost(self, use_power_mode: bool) -> int:
+        """计算单次调用需要扣除的次数"""
+        base_cost = 1
+        if use_power_mode and self.conf.get("enable_power_model", False):
+            extra = self.conf.get("power_model_extra_cost", 1)
+            try:
+                extra = int(extra)
+            except (TypeError, ValueError):
+                extra = 1
+            base_cost += max(0, extra)
+        return max(1, base_cost)
+
+    def _get_power_mode_hint(self, command_hint: str) -> Optional[str]:
+        """生成强力模式使用提示"""
+        if not self.conf.get("power_model_tip_enabled", False):
+            return None
+        if not self.conf.get("enable_power_model", False):
+            return None
+
+        keyword = (self.conf.get("power_model_keyword") or "").strip()
+        if not keyword:
+            return None
+
+        total_cost = self._get_required_invocation_cost(True)
+        return f"💡 输入 \"{command_hint} {keyword} ...\" 可消耗 {total_cost} 次额度调用强力模型。"
+
     async def _call_api(self, image_bytes_list: List[bytes], prompt: str,
                         override_model: str | None = None) -> bytes | str:
-        
+
         api_mode = self.conf.get("api_mode", "generic")
-        
+
         if api_mode == "gemini_official":
             base_url = self.conf.get("gemini_api_url", "https://generativelanguage.googleapis.com")
         else:
@@ -554,22 +601,50 @@ class FigurineProPlugin(Star):
         if not text:
             return
 
-        full_cmd_match = text.split()[0].strip()
-        suffix_match = re.search(r"[\(（](\d+)[\)）]$", full_cmd_match)
+        tokens = text.split()
+        if not tokens:
+            return
 
-        temp_model_idx = None
-        cmd = full_cmd_match
+        def _normalize_token(token: str) -> Tuple[str, Optional[int]]:
+            token = token.strip()
+            match = re.search(r"[\(（](\d+)[\)）]$", token)
+            if match:
+                idx = int(match.group(1))
+                return token[:match.start()].strip(), idx
+            return token, None
 
-        if suffix_match:
-            temp_model_idx = int(suffix_match.group(1))
-            cmd = full_cmd_match[:suffix_match.start()]
+        raw_cmd_token = tokens[0].strip()
+        command_token, temp_model_idx = _normalize_token(raw_cmd_token)
+        consumed_tokens = 1
+
+        cmd = command_token
+        if not cmd:
+            return
+
+        raw_power_keyword = (self.conf.get("power_model_keyword") or "").strip()
+        keyword_lower = raw_power_keyword.lower()
+        power_mode_requested = False
+        if keyword_lower and len(tokens) > consumed_tokens:
+            next_token = tokens[consumed_tokens].strip().lower()
+            if next_token == keyword_lower:
+                power_mode_requested = True
+                consumed_tokens += 1
+
+        power_model_name = (self.conf.get("power_model_id") or "").strip()
+        use_power_model = False
+        if power_mode_requested:
+            if not power_model_name:
+                yield event.plain_result("⚠️ 强力模式触发失败：请先在管理面板配置强力模型ID。")
+                return
+            use_power_model = True
 
         bnn_command = self.conf.get("extra_prefix", "bnn")
         user_prompt = ""
         is_bnn = False
 
         if cmd == bnn_command:
-            user_prompt = text.removeprefix(full_cmd_match).strip()
+            remaining_tokens = tokens[consumed_tokens:]
+            user_prompt = " ".join(remaining_tokens).strip()
             is_bnn = True
             if not user_prompt:
                 return
@@ -624,6 +699,7 @@ class FigurineProPlugin(Star):
         
         is_master = self.is_global_admin(event)
         deduction_source = None 
+        required_cost = self._get_required_invocation_cost(use_power_model)
 
         if is_master:
             deduction_source = 'free'
@@ -640,13 +716,13 @@ class FigurineProPlugin(Star):
             # 优先扣除群组
             if group_id and self.conf.get("enable_group_limit", False):
                 g_cnt = self._get_group_count(group_id)
-                if g_cnt > 0:
+                if g_cnt >= required_cost:
                     deduction_source = 'group'
             
             # 如果群组没次数（或未扣除群组），尝试扣除个人
             if deduction_source is None and self.conf.get("enable_user_limit", True):
                 u_cnt = self._get_user_count(sender_id)
-                if u_cnt > 0:
+                if u_cnt >= required_cost:
                     deduction_source = 'user'
             
             # 再次检查：是否两者都未开启限制？如果是，则免费
@@ -654,12 +730,9 @@ class FigurineProPlugin(Star):
                 if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
                     deduction_source = 'free'
                 else:
-                    msg = "❌ 次数不足。"
-                    if group_id and self.conf.get("enable_group_limit", False):
-                         msg = "❌ 本群或您的使用次数已用尽 (优先扣除群次数)。"
-                    else:
-                         msg = "❌ 您的使用次数已用完。"
-                    yield event.plain_result(msg)
+                    yield event.plain_result(
+                        self._build_limit_exhausted_message(group_id, use_power_mode, required_cost)
+                    )
                     return
 
         # --- 图片获取 ---
@@ -686,17 +759,27 @@ class FigurineProPlugin(Star):
         if temp_model_idx is not None:
             if 1 <= temp_model_idx <= len(all_models):
                 override_model_name = all_models[temp_model_idx - 1]
-                display_cmd += f" (模型: {override_model_name})"
             else:
                 yield event.plain_result(f"⚠️ 指定的模型序号 {temp_model_idx} 无效，将使用默认模型。")
 
-        yield event.plain_result(f"🎨 收到请求，正在生成 [{display_cmd}]...")
+        if use_power_model:
+            override_model_name = power_model_name
+
+        display_label = display_cmd
+
+        base_model_name = (self.conf.get("model", "nano-banana") or "nano-banana").strip() or "nano-banana"
+        model_in_use = (override_model_name or base_model_name).strip() or base_model_name
+        show_model_info = self.conf.get("show_model_info", False)
+
+        mode_prefix = "增强" if use_power_model else ""
+        info_msg = f"🎨 收到{mode_prefix}请求，正在生成 [{display_label}]..."
+        yield event.plain_result(info_msg)
 
         # --- 扣费执行 ---
-        if deduction_source == 'group':
-            await self._decrease_group_count(group_id)
+        if deduction_source == 'group' and group_id:
+            await self._decrease_group_count(group_id, required_cost)
         elif deduction_source == 'user':
-            await self._decrease_user_count(sender_id)
+            await self._decrease_user_count(sender_id, required_cost)
 
         start_time = datetime.now()
         res = await self._call_api(images_to_process, user_prompt, override_model=override_model_name)
@@ -705,7 +788,8 @@ class FigurineProPlugin(Star):
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
             
-            caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)", f"预设: {display_cmd}"]
+            status_text = "增强生成成功" if use_power_model else "生成成功"
+            caption_parts = [f"✅ {status_text} ({elapsed:.2f}s)", f"预设: {display_label}"]
             
             if deduction_source == 'free':
                 caption_parts.append("剩余: ∞")
@@ -717,11 +801,25 @@ class FigurineProPlugin(Star):
                 if self.conf.get("enable_user_limit", True):
                     caption_parts.append(f"用户剩余: {self._get_user_count(sender_id)}")
 
-            yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
+            if show_model_info:
+                caption_parts.append(f"模型: {model_in_use}")
+
+            message_text = " | ".join(caption_parts)
+            if not use_power_model:
+                if hint := self._get_power_mode_hint(cmd):
+                    message_text += f"\n{hint}"
+
+            yield event.chain_result([Image.fromBytes(res), Plain(message_text)])
         else:
-            msg = f"❌ 生成失败 ({elapsed:.2f}s)\n原因: {res}"
+            status_text = "增强生成失败" if use_power_model else "生成失败"
+            msg = f"❌ {status_text} ({elapsed:.2f}s)\n原因: {res}"
             if deduction_source in ['group', 'user']:
                 msg += "\n(注: 触发即扣次)"
+            if show_model_info:
+                msg += f"\n模型: {model_in_use}"
+            if not use_power_model:
+                if hint := self._get_power_mode_hint(cmd):
+                    msg += f"\n{hint}"
             yield event.plain_result(msg)
 
         event.stop_event()
@@ -749,8 +847,26 @@ class FigurineProPlugin(Star):
     @filter.command("文生图", prefix_optional=True)
     async def on_text_to_image(self, event: AstrMessageEvent):
         raw_cmd = event.message_str.strip()
-        prompt = raw_cmd
+        cmd_name = "文生图"
         override_model_name = None
+
+        cmd_pos = raw_cmd.find(cmd_name)
+        prompt = raw_cmd[cmd_pos + len(cmd_name):].strip() if cmd_pos != -1 else raw_cmd
+
+        power_model_name = (self.conf.get("power_model_id") or "").strip()
+        keyword = (self.conf.get("power_model_keyword") or "").strip()
+        keyword_lower = keyword.lower()
+        power_mode_requested = False
+
+        if self.conf.get("enable_power_model", False) and keyword_lower:
+            prompt_tokens = prompt.split()
+            if prompt_tokens and prompt_tokens[0].lower() == keyword_lower:
+                power_mode_requested = True
+                prompt = " ".join(prompt_tokens[1:]).strip()
+
+        if power_mode_requested and not power_model_name:
+            yield event.plain_result("⚠️ 强力模式触发失败：请先在管理面板配置强力模型ID。")
+            return
 
         match = re.match(r"^[\(（](\d+)[\)）]\s*(.*)", prompt)
         if match:
@@ -763,6 +879,10 @@ class FigurineProPlugin(Star):
                 yield event.plain_result(f"⚠️ 指定的模型序号 {idx} 无效。")
                 return
 
+        if power_mode_requested:
+            override_model_name = power_model_name
+
+        prompt = prompt.strip()
         if not prompt:
             yield event.plain_result("请提供描述。用法: #文生图 [可选:(序号)] <描述>")
             return
@@ -771,34 +891,43 @@ class FigurineProPlugin(Star):
         group_id = self._norm_id(event.get_group_id()) if event.get_group_id() else None
 
         # --- 权限逻辑复用 ---
+        use_power_model = power_mode_requested
+        required_cost = self._get_required_invocation_cost(use_power_model)
+
         deduction_source = None
         if self.is_global_admin(event):
             deduction_source = 'free'
         else:
             if group_id and self.conf.get("enable_group_limit", False):
-                if self._get_group_count(group_id) > 0:
+                if self._get_group_count(group_id) >= required_cost:
                     deduction_source = 'group'
             
             if deduction_source is None and self.conf.get("enable_user_limit", True):
-                if self._get_user_count(sender_id) > 0:
+                if self._get_user_count(sender_id) >= required_cost:
                     deduction_source = 'user'
             
             if deduction_source is None:
                 if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
                     deduction_source = 'free'
                 else:
-                    yield event.plain_result("❌ 您的使用次数已用完。")
+                    yield event.plain_result(
+                        self._build_limit_exhausted_message(group_id, use_power_model, required_cost)
+                    )
                     return
 
-        info_str = f"🎨 收到文生图请求，正在生成 [{prompt[:10]}...]"
-        if override_model_name:
-            info_str += f" (模型: {override_model_name})"
+        display_prompt = prompt[:10] + "..." if len(prompt) > 10 else prompt
+        mode_prefix = "增强" if power_mode_requested else ""
+        info_str = f"🎨 收到{mode_prefix}文生图请求，正在生成 [{display_prompt}]"
         yield event.plain_result(info_str)
 
-        if deduction_source == 'group':
-            await self._decrease_group_count(group_id)
+        base_model_name = (self.conf.get("model", "nano-banana") or "nano-banana").strip() or "nano-banana"
+        model_in_use = (override_model_name or base_model_name).strip() or base_model_name
+        show_model_info = self.conf.get("show_model_info", False)
+
+        if deduction_source == 'group' and group_id:
+            await self._decrease_group_count(group_id, required_cost)
         elif deduction_source == 'user':
-            await self._decrease_user_count(sender_id)
+            await self._decrease_user_count(sender_id, required_cost)
 
         start_time = datetime.now()
         res = await self._call_api([], prompt, override_model=override_model_name)
@@ -807,7 +936,8 @@ class FigurineProPlugin(Star):
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
             
-            caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)"]
+            status_text = "增强生成成功" if power_mode_requested else "生成成功"
+            caption_parts = [f"✅ {status_text} ({elapsed:.2f}s)"]
             if deduction_source == 'free':
                 caption_parts.append("剩余: ∞")
             else:
@@ -815,10 +945,24 @@ class FigurineProPlugin(Star):
                     caption_parts.append(f"本群剩余: {self._get_group_count(group_id)}")
                 if self.conf.get("enable_user_limit", True):
                     caption_parts.append(f"用户剩余: {self._get_user_count(sender_id)}")
+            if show_model_info:
+                caption_parts.append(f"模型: {model_in_use}")
 
-            yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
+            message_text = " | ".join(caption_parts)
+            if not power_mode_requested:
+                if hint := self._get_power_mode_hint(cmd_name):
+                    message_text += f"\n{hint}"
+
+            yield event.chain_result([Image.fromBytes(res), Plain(message_text)])
         else:
-            yield event.plain_result(f"❌ 生成失败: {res}")
+            status_text = "增强生成失败" if power_mode_requested else "生成失败"
+            msg = f"❌ {status_text}: {res}"
+            if show_model_info:
+                msg += f"\n模型: {model_in_use}"
+            if not power_mode_requested:
+                if hint := self._get_power_mode_hint(cmd_name):
+                    msg += f"\n{hint}"
+            yield event.plain_result(msg)
 
         event.stop_event()
 
@@ -965,12 +1109,14 @@ class FigurineProPlugin(Star):
     def _get_user_count(self, uid: str) -> int:
         return self.user_counts.get(self._norm_id(uid), 0)
 
-    async def _decrease_user_count(self, uid: str):
+    async def _decrease_user_count(self, uid: str, amount: int = 1):
         uid = self._norm_id(uid)
         count = self._get_user_count(uid)
-        if count > 0:
-            self.user_counts[uid] = count - 1
-            await self._save_user_counts()
+        if amount <= 0 or count <= 0:
+            return
+        deduction = min(amount, count)
+        self.user_counts[uid] = count - deduction
+        await self._save_user_counts()
 
     async def _load_group_counts(self):
         if not self.group_counts_file.exists():
@@ -992,12 +1138,14 @@ class FigurineProPlugin(Star):
     def _get_group_count(self, group_id: str) -> int:
         return self.group_counts.get(self._norm_id(group_id), 0)
 
-    async def _decrease_group_count(self, group_id: str):
+    async def _decrease_group_count(self, group_id: str, amount: int = 1):
         gid = self._norm_id(group_id)
         count = self._get_group_count(gid)
-        if count > 0:
-            self.group_counts[gid] = count - 1
-            await self._save_group_counts()
+        if amount <= 0 or count <= 0:
+            return
+        deduction = min(amount, count)
+        self.group_counts[gid] = count - deduction
+        await self._save_group_counts()
 
     async def _load_user_checkin_data(self):
         if not self.user_checkin_file.exists():
