@@ -24,16 +24,38 @@
 
 ### 配置
 
-在 AstrBot 管理面板的 `插件管理` -> `手办工坊 Pro` 中进行配置。
+在 AstrBot 管理面板的 `插件管理` -> `手办工坊 Pro` 中进行配置。常用项说明：
 
-| 配置项             | 类型   | 描述                                                                                                                              |
-| ------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `api_url`          | 字符串 | **(必需)** API 的请求地址。                                                                                                       |
-| `api_keys`         | 列表   | **(必需)** 你的 API 密钥。可以通过 `#手办化添加key` 指令管理，支持多个 Key。                                                             |
-| `use_proxy`        | 开关   | 是否为插件启用网络代理。                                                                                                          |
-| `proxy_url`        | 字符串 | 代理服务器地址，例如 `http://127.0.0.1:7890`。                                                                                    |
-| `help_text`        | 文本   | 自定义 `#手办化帮助` 指令回复的内容。                                                                                             |
-| `prompts`          | 对象   | **(核心)** 在这里自定义所有指令（如 `#手办化`、`#Q版化` 等）的生成提示词。                                                          |
+| 配置项 | 说明 |
+| --- | --- |
+| `generic_api_url` | Generic 模式 API 地址，例如 http://154.26.213.14:7000/v1/chat/completions |
+| `generic_api_keys` | Generic 模式 Key 池（可多条轮询），示例：123 |
+| `gemini_api_url` | Gemini 官方 Base 地址，默认 https://generativelanguage.googleapis.com |
+| `gemini_api_keys` | Gemini 官方模式 Key 池 |
+| `api_mode` | 协议模式：generic / gemini_official |
+| `model_list` | 可用模型 ID 列表，默认包含 nano-banana 等 |
+| `model` | 默认模型（需在模型列表中存在），示例：gemini-2.5-flash-preview-image |
+| `image_resolution` | 画质/分辨率参数，例：4K |
+| `enable_power_model` | 开启强力模式开关 |
+| `power_model_keyword` | 强力模式触发词，格式：指令 + 空格 + 触发词 + 提示词，例：手办化 pro [图] |
+| `power_model_id` | 强力模型 ID，例：gemini-3-pro-preview-image |
+| `power_model_tip_enabled` | 是否在普通模式回复里提醒强力模式格式和扣费 |
+| `power_model_extra_cost` | 强力模式额外扣次数（基础 1 次+额外值） |
+| `show_model_info` | 是否在成功/失败消息中显示实际调用模型 |
+| `prefix` | 是否需要命令前缀或 @ 才触发 |
+| `extra_prefix` | 自定义提示词前缀（如 bnn，用 bnn <prompt> 调用） |
+| `use_proxy` / `proxy_url` | 启用代理与代理地址 |
+| `timeout` | 请求超时（秒），默认 120 |
+| `use_stream` | Generic 模式是否走流式请求 |
+| `download_retries` | 图片下载重试次数 |
+| `help_text` | 自定义 #手办化帮助 文本 |
+| `user_whitelist` / `user_blacklist` | 用户白/黑名单 |
+| `group_whitelist` / `group_blacklist` | 群聊白/黑名单，白名单群不限制次数 |
+| `enable_user_limit` / `enable_group_limit` | 是否启用用户/群组次数限制 |
+| `enable_checkin` | 是否启用每日签到获取次数 |
+| `checkin_fixed_reward` | 签到固定奖励（未开启随机时） |
+| `enable_random_checkin` / `checkin_random_reward_max` | 签到随机奖励开关与最大值 |
+| `prompt_list` | 预设提示词列表，格式：触发词:提示词，可用 #lm添加 管理 |
 
 ## 使用方法
 
