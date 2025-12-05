@@ -41,11 +41,46 @@
             "gemini_official"
         ]
     },
+    "model_list": {
+        "description": "【核心】模型列表配置",
+        "type": "list",
+        "hint": "在此处配置所有可用的模型ID。系统将自动使用全局Key池进行调用。",
+        "items": {
+            "type": "string",
+            "description": "模型名称 (如 nano-banana, gemini-1.5-pro)"
+        },
+        "default": [
+            "nano-banana",
+            "nano-banana-2-4k",
+            "nano-banana-2-2k",
+            "nano-banana-2-1k",
+            "gemini-4k",
+            "gemini-2k",
+            "gemini-1k",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+            "gemini-3-pro-image-preview",
+            "gemini-2.5-flash-image",
+            "nano-banana-hd",
+            "gemini-2.5-flash-image-preview"
+        ]
+    },
     "model": {
         "description": "【通用】默认模型名称",
         "type": "string",
-        "hint": "当前默认使用的模型。可通过 #切换模型 指令修改。",
+        "hint": "当前默认使用的模型ID（需在模型列表中存在）。可通过 #切换模型 指令修改。",
         "default": "nano-banana"
+    },
+    "image_resolution": {
+        "description": "【画质】图像分辨率",
+        "type": "string",
+        "hint": "配置图像生成的参数，将根据模型能力自动调整 Prompt 画质权重。",
+        "default": "1K",
+        "options": [
+            "1K",
+            "2K",
+            "4K"
+        ]
     },
     "enable_power_model": {
         "description": "【高级】启用强力模型模式",
@@ -68,7 +103,7 @@
     "power_model_tip_enabled": {
         "description": "【高级】提示强力模式格式",
         "type": "bool",
-        "hint": "开启后，在回复中提醒用户可通过“指令 + 触发词 + 提示词”格式（如：手办化 pro [图片] / 文生图 pro 描述）消耗强力模式所需次数调用更强模型。",
+        "hint": "开启后，在回复中提醒用户可通过“指令 + 触发词 + 提示词”格式消耗强力模式所需次数调用更强模型。",
         "default": false
     },
     "power_model_extra_cost": {
@@ -82,30 +117,6 @@
         "type": "bool",
         "hint": "开启后，在成功或失败提示中展示实际使用的模型名称。",
         "default": false
-    },
-    "custom_model_1": {
-        "description": "【自定义】模型1 名称",
-        "type": "string",
-        "hint": "填入模型名称（如 gpt-4o），将在模型列表第8位显示。",
-        "default": ""
-    },
-    "custom_model_1_key": {
-        "description": "【自定义】模型1 专用Key",
-        "type": "string",
-        "hint": "仅供自定义模型1使用，留空则尝试使用对应的通用Key池。",
-        "default": ""
-    },
-    "custom_model_2": {
-        "description": "【自定义】模型2 名称",
-        "type": "string",
-        "hint": "填入模型名称，将在模型列表第9位显示。",
-        "default": ""
-    },
-    "custom_model_2_key": {
-        "description": "【自定义】模型2 专用Key",
-        "type": "string",
-        "hint": "仅供自定义模型2使用，留空则尝试使用对应的通用Key池。",
-        "default": ""
     },
     "prefix": {
         "description": "【基础】指令前缀限制",
@@ -154,7 +165,7 @@
         "type": "text",
         "editor_mode": true,
         "editor_language": "markdown",
-        "default": "🎨 手办化Pro插件使用帮助：\n\n📌 基础命令：\n#手办化 [图片] - 生成标准手办化图片\n#Q版化 [图片] - 生成Q版手办化图片\n#痛屋化 [图片] - 生成痛屋场景图片\n#痛车化 [图片] - 生成痛车场景图片\n#cos化 [图片] - 生成cosplay照片\n#cos自拍 [图片] - 生成cosplay自拍\n#孤独的我 [图片] - 生成孤独场景图片\n\n📌 数字版本：\n#手办化2 [图片] - 手办化版本2\n#手办化3 [图片] - 手办化版本3\n#手办化4 [图片] - 手办化版本4\n#手办化5 [图片] - 手办化版本5\n#手办化6 [图片] - 手办化版本6\n\n📌 新增命令：\n#第三视角 [图片] - 生成第三人称视角场景\n#痛屋化2 [图片] - 生成改良版痛屋场景\n#鬼图 [图片] - 生成灵异鬼图风格照片\n#第一视角 [图片] - 生成第一人称视角场景\n\n📌 预设管理：\n#lm查看 <关键词> - 查看预设提示词\n#lm添加 <关键词>:<提示词> - 添加/修改预设\n\n📌 统计与查询：\n#手办化查询次数 - 查询剩余次数\n#手办化今日统计 - (管理员)查看今日消耗\n\n📌 管理命令(管理员)：\n#手办化添加key <key> - 添加Key到当前模式\n#手办化key列表 - 查看当前模式Key池\n#切换API模式 generic/gemini_official\n\n📌 使用方式：\n1. 发送图片并使用命令\n2. 引用含有图片的消息并使用命令\n3. @某人使用命令（将使用该人的头像）"
+        "default": "🎨 手办化Pro插件使用帮助：\n\n📌 基础命令：\n#手办化 [图片] - 生成标准手办化图片\n#Q版化 [图片] - 生成Q版手办化图片\n#痛屋化 [图片] - 生成痛屋场景图片\n#痛车化 [图片] - 生成痛车场景图片\n#cos化 [图片] - 生成cosplay照片\n#cos自拍 [图片] - 生成cosplay自拍\n#孤独的我 [图片] - 生成孤独场景图片\n\n📌 数字版本：\n#手办化2 [图片] - 手办化版本2\n#手办化3 [图片] - 手办化版本3\n#手办化4 [图片] - 手办化版本4\n#手办化5 [图片] - 手办化版本5\n#手办化6 [图片] - 手办化版本6\n\n📌 新增命令：\n#第三视角 [图片] - 生成第三人称视角场景\n#痛屋化2 [图片] - 生成改良版痛屋场景\n#鬼图 [图片] - 生成灵异鬼图风格照片\n#第一视角 [图片] - 生成第一人称视角场景\n\n📌 预设管理：\n#lm列表 - 查看所有可用预设\n#lm查看 <关键词> - 查看预设提示词\n#lm添加 <关键词>:<提示词> - 添加/修改预设\n\n📌 统计与查询：\n#手办化查询次数 - 查询剩余次数\n#手办化今日统计 - (管理员)查看今日消耗\n\n📌 管理命令(管理员)：\n#手办化添加key <key> - 添加Key到当前模式\n#手办化key列表 - 查看当前模式Key池\n#切换API模式 generic/gemini_official\n#切换模型 - 查看或切换模型\n\n📌 使用方式：\n1. 发送图片并使用命令\n2. 引用含有图片的消息并使用命令\n3. @某人使用命令（将使用该人的头像）\n4. #bnn <提示词> (自动识别文生图/图生图)"
     },
     "user_whitelist": {
         "description": "【权限】用户白名单",
