@@ -28,7 +28,7 @@
 
 | 配置项 | 说明 |
 | --- | --- |
-| `generic_api_url` | Generic 模式 API 地址，例如 http://154.26.213.14:7000/v1/chat/completions |
+| `generic_api_url` | Generic 模式 API 地址，例如 https://api.example.com/v1/chat/completions |
 | `generic_api_keys` | Generic 模式 Key 池（可多条轮询），示例：123 |
 | `gemini_api_url` | Gemini 官方 Base 地址，默认 https://generativelanguage.googleapis.com |
 | `gemini_api_keys` | Gemini 官方模式 Key 池 |
