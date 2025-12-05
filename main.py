@@ -431,13 +431,11 @@ class FigurineProPlugin(Star):
         return f"💡 输入 \"{command_hint} {keyword} ...\" 可消耗 {total_cost} 次额度调用强力模型。"
 
     def _format_error_message(self, status_text: str, elapsed: float, detail: Any) -> str:
-        """构造错误消息：中文概况 + 可选完整详情"""
+        """构造错误消息：默认只发概况，调试模式下在终端输出完整错误"""
         summary = f"❌ {status_text} ({elapsed:.2f}s)"
-        detail_str = str(detail)
         if self.conf.get("debug_mode", False):
-            return f"{summary}\n原因: {detail_str}"
-        brief = detail_str if len(detail_str) <= 120 else detail_str[:120] + "..."
-        return f"{summary}\n原因: {brief}"
+            logger.error(f"调试模式错误详情: {detail}")
+        return summary
 
     async def _call_api(self, image_bytes_list: List[bytes], prompt: str,
                         override_model: str | None = None) -> bytes | str:
