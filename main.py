@@ -430,6 +430,13 @@ class FigurineProPlugin(Star):
         total_cost = self._get_required_invocation_cost(True)
         return f"💡 输入 \"{command_hint} {keyword} ...\" 可消耗 {total_cost} 次额度调用强力模型。"
 
+    def _format_error_message(self, status_text: str, elapsed: float, detail: Any) -> str:
+        """构造错误消息：默认只发概况，调试模式下在终端输出完整错误"""
+        summary = f"❌ {status_text} ({elapsed:.2f}s)"
+        if self.conf.get("debug_mode", False):
+            logger.error(f"调试模式错误详情: {detail}")
+        return summary
+
     async def _call_api(self, image_bytes_list: List[bytes], prompt: str,
                         override_model: str | None = None) -> bytes | str:
 
@@ -852,7 +859,7 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Image.fromBytes(res), Plain(message_text)])
         else:
             status_text = "增强生成失败" if use_power_model else "生成失败"
-            msg = f"❌ {status_text} ({elapsed:.2f}s)\n原因: {res}"
+            msg = self._format_error_message(status_text, elapsed, res)
             if deduction_source in ['group', 'user']:
                 msg += "\n(注: 触发即扣次)"
             if show_model_info:
@@ -995,7 +1002,7 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Image.fromBytes(res), Plain(message_text)])
         else:
             status_text = "增强生成失败" if power_mode_requested else "生成失败"
-            msg = f"❌ {status_text}: {res}"
+            msg = self._format_error_message(status_text, elapsed, res)
             if show_model_info:
                 msg += f"\n模型: {model_in_use}"
             if not power_mode_requested:

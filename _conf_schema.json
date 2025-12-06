@@ -118,6 +118,12 @@
         "hint": "开启后，在成功或失败提示中展示实际使用的模型名称。",
         "default": false
     },
+    "debug_mode": {
+        "description": "【调试】调试模式",
+        "type": "bool",
+        "hint": "开启后，报错时输出完整错误内容，便于排查。",
+        "default": false
+    },
     "prefix": {
         "description": "【基础】指令前缀限制",
         "type": "bool",
