@@ -224,7 +224,7 @@
         "type": "bool",
         "hint": "开启后，限制每个群组的总调用次数。",
         "default": false
-    },
+    }，
     "enable_checkin": {
         "description": "【签到】启用每日签到",
         "type": "bool",
@@ -236,7 +236,7 @@
         "type": "int",
         "hint": "关闭随机奖励时，每次签到获得的次数。",
         "default": 3
-    }，
+    },
     "enable_random_checkin": {
         "description": "【签到】启用随机奖励",
         "type": "bool",
@@ -254,7 +254,7 @@
         "default": "高清",
         "options": [
             "标准"，
-            "高清",
+            "高清"，
             "超清"
         ]
     },
@@ -264,7 +264,7 @@
         "hint": "控制#lm列表命令生成的表格每行显示几个预设，建议3-6列。",
         "default": 5,
         "min": 1,
-        "max": 10
+        "max": 10086
     },
     "prompt_list": {
         "description": "提示词预设列表",
