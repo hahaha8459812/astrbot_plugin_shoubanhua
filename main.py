@@ -24,7 +24,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.6.9",
+    "1.6.8",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -93,36 +93,78 @@ class FigurineProPlugin(Star):
             return await loop.run_in_executor(None, self._extract_first_frame_sync, raw)
 
         async def get_images(self, event: AstrMessageEvent) -> List[bytes]:
+            """增强的图片获取方法，支持多@用户和混合@与图片"""
             img_bytes_list: List[bytes] = []
             at_user_ids: List[str] = []
 
+            logger.info("=== 开始获取图片资源 ===")
+            logger.info(f"消息平台: {event.platform}")
+            logger.info(f"消息内容: {event.message_str}")
+
+            # 1. 处理回复链中的图片
             for seg in event.message_obj.message:
                 if isinstance(seg, Reply) and seg.chain:
+                    logger.info(f"发现回复链，长度: {len(seg.chain)}")
                     for s_chain in seg.chain:
                         if isinstance(s_chain, Image):
+                            logger.info("在回复链中发现图片")
                             if s_chain.url and (img := await self._load_bytes(s_chain.url)):
                                 img_bytes_list.append(img)
+                                logger.info("成功从回复链URL加载图片")
                             elif s_chain.file and (img := await self._load_bytes(s_chain.file)):
                                 img_bytes_list.append(img)
+                                logger.info("成功从回复链文件加载图片")
 
+            # 2. 处理当前消息中的图片
             for seg in event.message_obj.message:
                 if isinstance(seg, Image):
+                    logger.info("在当前消息中发现图片")
                     if seg.url and (img := await self._load_bytes(seg.url)):
                         img_bytes_list.append(img)
+                        logger.info("成功从当前消息URL加载图片")
                     elif seg.file and (img := await self._load_bytes(seg.file)):
                         img_bytes_list.append(img)
-                elif isinstance(seg, At):
+                        logger.info("成功从当前消息文件加载图片")
+
+            # 3. 处理@用户（支持多@）
+            for seg in event.message_obj.message:
+                if isinstance(seg, At):
                     at_user_ids.append(str(seg.qq))
+                    logger.info(f"发现@用户: {seg.qq}")
 
-            if img_bytes_list:
-                return img_bytes_list
+            # 4. 处理命令文本中的@用户（从文本提取QQ号）
+            import re
+            text_at_matches = re.findall(r'@(\d+)', event.message_str)
+            for qq in text_at_matches:
+                if qq not in at_user_ids:
+                    at_user_ids.append(qq)
+                    logger.info(f"从文本提取到@用户: {qq}")
 
+            logger.info(f"总共发现 {len(at_user_ids)} 个@用户")
+            if at_user_ids:
+                logger.info(f"@用户详情: {at_user_ids}")
+
+            # 5. 获取@用户的头像
             if at_user_ids:
                 for user_id in at_user_ids:
+                    logger.info(f"尝试获取用户 [{user_id}] 的头像...")
                     if avatar := await self._get_avatar(user_id):
                         img_bytes_list.append(avatar)
-                return img_bytes_list
+                        logger.info(f"成功获取用户 [{user_id}] 的头像")
+                    else:
+                        logger.warning(f"无法获取用户 [{user_id}] 的头像")
 
+            logger.info(f"成功获取 {len(img_bytes_list)} 个@用户头像")
+
+            # 6. 如果没有图片且没有@用户，尝试获取发送者头像
+            if not img_bytes_list and not at_user_ids:
+                sender_id = str(event.get_sender_id())
+                logger.info(f"未找到图片和@用户，尝试获取发送者 [{sender_id}] 的头像...")
+                if avatar := await self._get_avatar(sender_id):
+                    img_bytes_list.append(avatar)
+                    logger.info("成功获取发送者头像作为兜底")
+
+            logger.info(f"最终获取到 {len(img_bytes_list)} 张图片")
             return img_bytes_list
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -134,12 +176,15 @@ class FigurineProPlugin(Star):
         self.group_counts_file = self.plugin_data_dir / "group_counts.json"
         self.user_checkin_file = self.plugin_data_dir / "user_checkin.json"
         self.daily_stats_file = self.plugin_data_dir / "daily_stats.json"
+        self.preset_images_file = self.plugin_data_dir / "preset_images.json"
+        self.preset_images_dir = self.plugin_data_dir / "preset_images"
 
         self.user_counts: Dict[str, int] = {}
         self.group_counts: Dict[str, int] = {}
         self.user_checkin_data: Dict[str, str] = {}
         self.daily_stats: Dict[str, Any] = {}
         self.prompt_map: Dict[str, str] = {}
+        self.preset_images: Dict[str, str] = {}  # 预设词 -> 图片文件名映射
 
         self.generic_key_index = 0
         self.gemini_key_index = 0
@@ -161,6 +206,11 @@ class FigurineProPlugin(Star):
         await self._load_user_checkin_data()
         await self._load_daily_stats()
         await self._load_prompt_map()
+        await self._load_preset_images()
+        
+        # 创建预设图片目录
+        if not self.preset_images_dir.exists():
+            self.preset_images_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("FigurinePro 插件已加载")
         
@@ -169,6 +219,88 @@ class FigurineProPlugin(Star):
         
         if not g_keys and not o_keys:
              logger.warning("FigurinePro: 未配置任何 API Key")
+
+    def _extract_image_urls_from_text(self, text: str) -> List[str]:
+        """从文本中提取图片链接和本地文件路径"""
+        image_urls = []
+        
+        # 1. 匹配本地文件路径 (仅Windows绝对路径)
+        # 匹配 C:\path\to\image.jpg 格式
+        local_file_patterns = [
+            r'[a-zA-Z]:\\[^\s,，。！？\n]+\.(?:jpg|jpeg|png|gif|bmp|webp)',  # Windows绝对路径
+        ]
+        
+        for pattern in local_file_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if match and match not in image_urls:
+                    # 检查文件是否存在
+                    if Path(match).exists():
+                        image_urls.append(match)
+        
+        # 2. 匹配常见的图片链接格式
+        url_patterns = [
+            r'https?://[^\s<>"\'\)]+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^\s<>"\'\)]*)?(?=[\s<>"\'\)|$])',
+            r'https?://[^\s<>"\'\)]+/(?:s\d+/|upload/|image/|img/|pic/)[^\s<>"\'\)]+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^\s<>"\'\)]*)?(?=[\s<>"\'\)|$])',
+            r'https?://youke\d+\.picui\.cn/[^\s<>"\'\)]+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^\s<>"\'\)]*)?(?=[\s<>"\'\)|$])'
+        ]
+        
+        for pattern in url_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if match and match not in image_urls:
+                    image_urls.append(match)
+        
+        return image_urls
+
+    async def _download_preset_image(self, image_url: str) -> bytes | None:
+        """下载预设内容中的图片（支持本地文件和网络图片）"""
+        import ssl
+        from pathlib import Path
+        
+        # 清理URL，移除可能的尾随标点符号
+        clean_url = image_url.strip().rstrip('.,;:!?')
+        
+        # 检查是否是本地文件路径
+        if Path(clean_url).is_file():
+            logger.info(f"检测到本地文件路径: {clean_url}")
+            try:
+                # 使用现有的 _load_bytes 方法处理本地文件
+                return await self.iwf._load_bytes(clean_url)
+            except Exception as e:
+                logger.error(f"加载本地文件失败: {clean_url}, 错误: {e}")
+                return None
+        
+        # 网络图片处理（原有的下载逻辑）
+        for attempt in range(3):  # 最多重试3次
+            try:
+                logger.info(f"正在下载预设内容中的网络图片: {clean_url} (尝试 {attempt + 1}/3)")
+                
+                # 创建SSL上下文，允许更多SSL配置
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                # 创建不使用代理的下载器，使用自定义SSL上下文
+                timeout = aiohttp.ClientTimeout(total=60)
+                connector = aiohttp.TCPConnector(ssl=ssl_context, limit=10)
+                
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    }
+                    async with session.get(clean_url, headers=headers) as resp:
+                        resp.raise_for_status()
+                        return await resp.read()
+                        
+            except Exception as e:
+                logger.warning(f"下载预设图片失败 (尝试 {attempt + 1}/3): {clean_url}, 错误: {e}")
+                if attempt < 2:  # 如果不是最后一次尝试，等待1秒
+                    await asyncio.sleep(1)
+                else:
+                    logger.error(f"下载预设图片最终失败: {clean_url}, 错误: {e}")
+                    return None
+        return None
 
     async def _load_prompt_map(self):
         self.prompt_map.clear()
@@ -392,7 +524,10 @@ class FigurineProPlugin(Star):
         use_power_mode: bool = False,
         required_cost: int = 1,
     ) -> str:
-        if group_id and self.conf.get("enable_group_limit", False):
+        if use_power_mode:
+            # 强力模式只提示个人次数不足
+            msg = f"❌ 个人次数不足。需要 {required_cost} 次。"
+        elif group_id and self.conf.get("enable_group_limit", False):
             msg = "❌ 本群或您的使用次数已用尽 (优先扣除群次数)。"
         else:
             msg = "❌ 您的使用次数已用完。"
@@ -428,11 +563,18 @@ class FigurineProPlugin(Star):
             return None
 
         total_cost = self._get_required_invocation_cost(True)
-        return f"💡 输入 \"{command_hint} {keyword} ...\" 可消耗 {total_cost} 次额度调用强力模型。"
+        return f"💡 输入 \"{command_hint} {keyword} ...\" 可消耗 {total_cost} 次个人次数调用强力模型。"
 
     def _format_error_message(self, status_text: str, elapsed: float, detail: Any) -> str:
-        """构造错误消息：默认只发概况，调试模式下在终端输出完整错误"""
+        """构造错误消息：默认只发overview，调试模式下在终端输出完整错误"""
         summary = f"❌ {status_text} ({elapsed:.2f}s)"
+        
+        # 如果detail包含图片下载失败的信息，返回概述+详细信息给用户
+        if isinstance(detail, str) and ("图片下载失败" in detail or "图片获取未完成" in detail) and "请手动访问链接查看" in detail:
+            # 移除"失败"等敏感词，避免被插件拦截
+            safe_detail = detail.replace("图片下载失败", "图片获取未完成").replace("失败", "未完成")
+            return f"{summary}\n{safe_detail}"
+        
         if self.conf.get("debug_mode", False):
             logger.error(f"调试模式错误详情: {detail}")
         return summary
@@ -616,7 +758,13 @@ class FigurineProPlugin(Star):
                         b64 = url_or_b64.split(",")[-1]
                         return base64.b64decode(b64)
                     else:
-                        return await self.iwf._download_image(url_or_b64) or "下载生成图片失败"
+                        # 尝试下载图片，如果下载失败则返回图片链接
+                        downloaded_image = await self.iwf._download_image(url_or_b64)
+                        if downloaded_image:
+                            return downloaded_image
+                        else:
+                            logger.warning(f"图片获取未完成，返回图片链接: {url_or_b64}")
+                            return f"图片获取未完成，请手动访问链接查看: {url_or_b64}"
 
         except asyncio.TimeoutError:
             return "请求超时"
@@ -653,15 +801,24 @@ class FigurineProPlugin(Star):
         if not cmd:
             return
 
-        # 强力模式参数解析
+        # 强力模式参数解析 - 需要在%符号分割之前处理
         raw_power_keyword = (self.conf.get("power_model_keyword") or "").strip()
         keyword_lower = raw_power_keyword.lower()
         power_mode_requested = False
-        if keyword_lower and len(tokens) > consumed_tokens:
+        
+        # 先检查是否在命令本身中包含强力模式触发词
+        if keyword_lower and keyword_lower in cmd.lower():
+            # 从命令中移除触发词
+            cmd = cmd.lower().replace(keyword_lower, "").strip()
+            power_mode_requested = True
+            logger.info(f"在命令中检测到强力模式触发词'{keyword_lower}'，移除后命令='{cmd}'")
+        elif keyword_lower and len(tokens) > consumed_tokens:
+            # 检查下一个token是否是触发词
             next_token = tokens[consumed_tokens].strip().lower()
             if next_token == keyword_lower:
                 power_mode_requested = True
                 consumed_tokens += 1
+                logger.info(f"检测到强力模式触发词作为独立token: '{keyword_lower}'")
 
         power_model_name = (self.conf.get("power_model_id") or "").strip()
         use_power_model = False
@@ -676,15 +833,32 @@ class FigurineProPlugin(Star):
         user_prompt = ""
         is_bnn = False
 
-        if cmd == bnn_command:
+        # %符号分割逻辑 - 支持在命令中分割基础命令和追加内容
+        base_cmd = cmd
+        append_text = ""
+        
+        # 检查命令中是否包含%符号（在强力模式处理之后）
+        if "%" in cmd:
+            # 分割命令，只分割第一个%
+            parts = cmd.split("%", 1)
+            if len(parts) == 2:
+                base_cmd = parts[0].strip()
+                append_text = parts[1].strip()
+                logger.info(f"检测到%符号分割: 基础命令='{base_cmd}', 追加内容='{append_text}'")
+
+        if base_cmd == bnn_command:
             remaining_tokens = tokens[consumed_tokens:]
             user_prompt = " ".join(remaining_tokens).strip()
             is_bnn = True
 
-        elif cmd in self.prompt_map:
-            val = self.prompt_map.get(cmd)
+        elif base_cmd in self.prompt_map:
+            val = self.prompt_map.get(base_cmd)
             if val and val != "[内置预设]":
-                 user_prompt = val
+                user_prompt = val
+                # 如果有追加内容，拼接到prompt后面
+                if append_text:
+                    user_prompt = user_prompt + append_text
+                    logger.info(f"将追加内容'{append_text}'添加到预设prompt后面")
 
         if not user_prompt and not is_bnn:
             cmd_map = {
@@ -698,12 +872,20 @@ class FigurineProPlugin(Star):
                 "第三视角": "view_3", "鬼图": "ghost", "第一视角": "view_1",
                 "手办化帮助": "help"
             }
-            if cmd in cmd_map:
-                key = cmd_map[cmd]
+            if base_cmd in cmd_map:
+                key = cmd_map[base_cmd]
                 if key == "help":
                     yield self._get_help_result(event)
                     return
-                user_prompt = self.prompt_map.get(key) or self.prompt_map.get(cmd)
+                user_prompt = self.prompt_map.get(key) or self.prompt_map.get(base_cmd)
+                # 如果有追加内容，拼接到prompt后面
+                if append_text:
+                    user_prompt = user_prompt + append_text
+                    logger.info(f"将追加内容'{append_text}'添加到映射命令prompt后面")
+        
+        # 记录强力模式状态用于调试
+        if power_mode_requested:
+            logger.info(f"🚀 强力模式已激活！触发词: '{raw_power_keyword}', 使用模型: '{power_model_name}'")
 
         if not user_prompt:
              if is_bnn:
@@ -744,24 +926,37 @@ class FigurineProPlugin(Star):
             return
 
         if deduction_source is None:
-            if group_id and self.conf.get("enable_group_limit", False):
-                g_cnt = self._get_group_count(group_id)
-                if g_cnt >= required_cost:
-                    deduction_source = 'group'
-            
-            if deduction_source is None and self.conf.get("enable_user_limit", True):
-                u_cnt = self._get_user_count(sender_id)
-                if u_cnt >= required_cost:
-                    deduction_source = 'user'
-            
-            if deduction_source is None:
-                if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
-                    deduction_source = 'free'
+            # 强力模式只扣除个人次数
+            if use_power_model:
+                if self.conf.get("enable_user_limit", True):
+                    u_cnt = self._get_user_count(sender_id)
+                    if u_cnt >= required_cost:
+                        deduction_source = 'user'
+                    else:
+                        yield event.plain_result(f"❌ 个人次数不足。需要 {required_cost} 次，当前剩余 {u_cnt} 次。")
+                        return
                 else:
-                    yield event.plain_result(
-                        self._build_limit_exhausted_message(group_id, use_power_model, required_cost)
-                    )
-                    return
+                    deduction_source = 'free'
+            else:
+                # 普通模式保持原有逻辑
+                if group_id and self.conf.get("enable_group_limit", False):
+                    g_cnt = self._get_group_count(group_id)
+                    if g_cnt >= required_cost:
+                        deduction_source = 'group'
+                
+                if deduction_source is None and self.conf.get("enable_user_limit", True):
+                    u_cnt = self._get_user_count(sender_id)
+                    if u_cnt >= required_cost:
+                        deduction_source = 'user'
+                
+                if deduction_source is None:
+                    if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
+                        deduction_source = 'free'
+                    else:
+                        yield event.plain_result(
+                            self._build_limit_exhausted_message(group_id, use_power_model, required_cost)
+                        )
+                        return
 
         # --- 图片获取 (融合逻辑) ---
         images_to_process = []
@@ -785,10 +980,23 @@ class FigurineProPlugin(Star):
                         img_bytes_list = [avatar]
                      else:
                         yield event.plain_result("请发送或引用一张图片。")
-                        return
              
              if not is_text_to_image and img_bytes_list:
                 images_to_process = img_bytes_list
+
+        # --- 检查预设内容中的图片链接 ---
+        if not is_bnn and user_prompt and not is_text_to_image:
+            # 从预设内容中提取图片链接
+            image_urls = self._extract_image_urls_from_text(user_prompt)
+            if image_urls:
+                logger.info(f"在预设内容中发现 {len(image_urls)} 个图片链接: {image_urls}")
+                # 下载图片链接并添加到处理列表的最后
+                for image_url in image_urls:
+                    if downloaded_image := await self._download_preset_image(image_url):
+                        images_to_process.append(downloaded_image)
+                        logger.info(f"成功下载预设内容中的图片: {image_url}")
+                    else:
+                        logger.warning(f"无法下载预设内容中的图片: {image_url}")
 
         display_cmd = cmd
         if is_bnn:
@@ -798,6 +1006,16 @@ class FigurineProPlugin(Star):
                 yield event.plain_result(f"🎨 检测到 {len(img_bytes_list)} 张图片，已选取前 {MAX_IMAGES} 张…")
             
             display_cmd = user_prompt[:10] + '...' if len(user_prompt) > 10 else user_prompt
+        elif len(images_to_process) > 0:
+            # 对于非bnn模式，如果有多个@用户，保留所有头像，但限制最大数量
+            MAX_FIGURINE_IMAGES = 3  # 手办化等预设模式最多处理3张图片
+            if len(images_to_process) > MAX_FIGURINE_IMAGES:
+                images_to_process = images_to_process[:MAX_FIGURINE_IMAGES]
+                yield event.plain_result(f"🎨 检测到 {len(img_bytes_list)} 张图片（含@用户头像），已选取前 {MAX_FIGURINE_IMAGES} 张…")
+        
+        # 如果有追加内容，在显示命令中包含追加内容提示
+        if append_text:
+            display_cmd = f"{base_cmd}%{append_text[:5]}..."
 
         # 模型选择
         override_model_name = None
@@ -834,6 +1052,10 @@ class FigurineProPlugin(Star):
 
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
+            
+            # 保存预设图片（如果是预设命令）
+            if base_cmd in self.prompt_map and not is_bnn:
+                await self._save_preset_image(base_cmd, res)
             
             status_text = "增强生成成功" if use_power_model else "生成成功"
             caption_parts = [f"✅ {status_text} ({elapsed:.2f}s)", f"预设: {display_label}"]
@@ -942,22 +1164,35 @@ class FigurineProPlugin(Star):
         if self.is_global_admin(event):
             deduction_source = 'free'
         else:
-            if group_id and self.conf.get("enable_group_limit", False):
-                if self._get_group_count(group_id) >= required_cost:
-                    deduction_source = 'group'
-            
-            if deduction_source is None and self.conf.get("enable_user_limit", True):
-                if self._get_user_count(sender_id) >= required_cost:
-                    deduction_source = 'user'
-            
-            if deduction_source is None:
-                if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
-                    deduction_source = 'free'
+            # 强力模式只扣除个人次数
+            if use_power_model:
+                if self.conf.get("enable_user_limit", True):
+                    u_cnt = self._get_user_count(sender_id)
+                    if u_cnt >= required_cost:
+                        deduction_source = 'user'
+                    else:
+                        yield event.plain_result(f"❌ 个人次数不足。需要 {required_cost} 次，当前剩余 {u_cnt} 次。")
+                        return
                 else:
-                    yield event.plain_result(
-                        self._build_limit_exhausted_message(group_id, use_power_model, required_cost)
-                    )
-                    return
+                    deduction_source = 'free'
+            else:
+                # 普通模式保持原有逻辑
+                if group_id and self.conf.get("enable_group_limit", False):
+                    if self._get_group_count(group_id) >= required_cost:
+                        deduction_source = 'group'
+                
+                if deduction_source is None and self.conf.get("enable_user_limit", True):
+                    if self._get_user_count(sender_id) >= required_cost:
+                        deduction_source = 'user'
+                
+                if deduction_source is None:
+                    if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
+                        deduction_source = 'free'
+                    else:
+                        yield event.plain_result(
+                            self._build_limit_exhausted_message(group_id, use_power_model, required_cost)
+                        )
+                        return
 
         display_prompt = prompt[:10] + "..." if len(prompt) > 10 else prompt
         mode_prefix = "增强" if power_mode_requested else ""
@@ -1075,7 +1310,7 @@ class FigurineProPlugin(Star):
 
     @filter.command("lm列表", aliases={"lmlist", "预设列表"}, prefix_optional=True)
     async def on_get_preset_list(self, event: AstrMessageEvent):
-        """输出所有可用预设列表"""
+        """输出所有可用预设列表，5xN表格格式，上面是图片，下面是预设名称"""
         if not self.prompt_map:
             yield event.plain_result("⚠️ 当前没有可用的预设。")
             return
@@ -1092,24 +1327,207 @@ class FigurineProPlugin(Star):
 
         built_in.sort()
         custom.sort()
+        
+        # 合并所有预设并按名称排序
+        all_presets = []
+        for preset in built_in:
+            all_presets.append((preset, True))  # True表示内置预设
+        for preset in custom:
+            all_presets.append((preset, False))  # False表示自定义预设
+        
+        # 按预设名称排序
+        all_presets.sort(key=lambda x: x[0])
+        
+        if not all_presets:
+            yield event.plain_result("⚠️ 当前没有可用的预设。")
+            return
 
-        msg = "📜 **可用预设列表**\n"
-        msg += "==================\n"
-        
-        if built_in:
-            msg += "📌 **内置预设**:\n"
-            msg += "  " + "、".join(built_in) + "\n\n"
-        
-        if custom:
-            msg += "✨ **自定义预设**:\n"
-            msg += "  " + "、".join(custom) + "\n"
-        else:
-            msg += "✨ **自定义预设**: (无)\n"
+        try:
+            # 创建表格图片
+            table_image = await self._create_preset_table_image(all_presets)
+            
+            # 创建标题消息
+            title_msg = "📜 **可用预设列表**\n"
+            title_msg += f"共 {len(all_presets)} 个预设 (内置: {len(built_in)}, 自定义: {len(custom)})\n"
+            title_msg += "使用方法: #预设名 [图片]"
+            
+            # 发送图片和标题
+            yield event.chain_result([
+                Plain(title_msg + "\n\n"),
+                Image.fromBytes(table_image)
+            ])
+            
+        except Exception as e:
+            logger.error(f"创建预设表格图片失败: {e}")
+            # 如果图片创建失败，回退到文本模式
+            plain_msg = "📜 **可用预设列表**\n"
+            plain_msg += "==================\n"
+            
+            if built_in:
+                plain_msg += "📌 **内置预设**:\n"
+                for preset in built_in:
+                    plain_msg += f"  • {preset}\n"
+                plain_msg += "\n"
+            
+            if custom:
+                plain_msg += "✨ **自定义预设**:\n"
+                for preset in custom:
+                    plain_msg += f"  • {preset}\n"
+            else:
+                plain_msg += "✨ **自定义预设**: (无)\n\n"
 
-        msg += "==================\n"
-        msg += "使用方法: #预设名 [图片]"
+            plain_msg += "==================\n"
+            plain_msg += "使用方法: #预设名 [图片]"
+            
+            yield event.plain_result(plain_msg)
+
+    async def _create_preset_table_image(self, presets: List[Tuple[str, bool]]) -> bytes:
+        """创建5xN表格图片，上面是图片，下面是预设名称"""
+        # 表格参数
+        cols = 5  # 每行5个
+        cell_width = 200
+        cell_height = 250  # 图片区域200px + 文字区域50px
+        image_area_height = 200
+        text_area_height = 50
+        padding = 10
         
-        yield event.plain_result(msg)
+        # 计算行数
+        rows = (len(presets) + cols - 1) // cols
+        
+        # 计算图片尺寸
+        table_width = cols * cell_width + (cols + 1) * padding
+        table_height = rows * cell_height + (rows + 1) * padding
+        
+        # 创建白色背景图片
+        table_img = PILImage.new('RGB', (table_width, table_height), 'white')
+        
+        # 准备字体（尝试使用支持中文的字体）
+        try:
+            from PIL import ImageFont
+            # 尝试使用支持中文的字体
+            font_paths = [
+                "C:/Windows/Fonts/simhei.ttf",     # 黑体
+                "C:/Windows/Fonts/simsun.ttc",     # 宋体
+                "C:/Windows/Fonts/msyh.ttc",       # 微软雅黑
+                "C:/Windows/Fonts/msyhbd.ttc",     # 微软雅黑粗体
+                "arial.ttf"                         # 英文字体作为最后备选
+            ]
+            
+            font = None
+            title_font = None
+            
+            for font_path in font_paths:
+                try:
+                    if Path(font_path).exists():
+                        font = ImageFont.truetype(font_path, 16)
+                        title_font = ImageFont.truetype(font_path, 20)
+                        break
+                except:
+                    continue
+            
+            # 如果都找不到，使用默认字体
+            if not font:
+                font = ImageFont.load_default()
+                title_font = ImageFont.load_default()
+                
+        except:
+            font = None
+            title_font = None
+        
+        # 创建绘图对象
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(table_img)
+        
+        # 绘制每个单元格
+        for i, (preset_name, is_built_in) in enumerate(presets):
+            row = i // cols
+            col = i % cols
+            
+            # 计算单元格位置
+            x = padding + col * (cell_width + padding)
+            y = padding + row * (cell_height + padding)
+            
+            # 获取预设图片
+            image_path = self._get_preset_image_path(preset_name)
+            
+            # 绘制图片区域
+            if image_path:
+                try:
+                    # 加载并调整图片大小
+                    preset_img = PILImage.open(image_path)
+                    # 保持纵横比，填充到200x200
+                    preset_img.thumbnail((cell_width - 2*padding, image_area_height - 2*padding), PILImage.Resampling.LANCZOS)
+                    
+                    # 计算居中位置
+                    img_width, img_height = preset_img.size
+                    img_x = x + (cell_width - img_width) // 2
+                    img_y = y + (image_area_height - img_height) // 2
+                    
+                    # 粘贴图片
+                    table_img.paste(preset_img, (img_x, img_y))
+                    
+                except Exception as e:
+                    logger.error(f"加载预设图片失败 {preset_name}: {e}")
+                    # 绘制占位符
+                    draw.rectangle([x + padding, y + padding, x + cell_width - padding, y + image_area_height - padding], 
+                                 outline='lightgray', width=2)
+                    placeholder_text = "无图片"
+                    if font:
+                        bbox = draw.textbbox((0, 0), placeholder_text, font=font)
+                        text_width = bbox[2] - bbox[0]
+                        text_height = bbox[3] - bbox[1]
+                    else:
+                        text_width = len(placeholder_text) * 8
+                        text_height = 16
+                    text_x = x + (cell_width - text_width) // 2
+                    text_y = y + (image_area_height - text_height) // 2
+                    draw.text((text_x, text_y), placeholder_text, fill='gray', font=font)
+            else:
+                # 没有图片，绘制占位符
+                draw.rectangle([x + padding, y + padding, x + cell_width - padding, y + image_area_height - padding], 
+                             outline='lightgray', width=2)
+                placeholder_text = "无图片"
+                if font:
+                    bbox = draw.textbbox((0, 0), placeholder_text, font=font)
+                    text_width = bbox[2] - bbox[0]
+                    text_height = bbox[3] - bbox[1]
+                else:
+                    text_width = len(placeholder_text) * 8
+                    text_height = 16
+                text_x = x + (cell_width - text_width) // 2
+                text_y = y + (image_area_height - text_height) // 2
+                draw.text((text_x, text_y), placeholder_text, fill='gray', font=font)
+            
+            # 绘制文字区域背景
+            text_y_pos = y + image_area_height
+            draw.rectangle([x, text_y_pos, x + cell_width, text_y_pos + text_area_height], fill='lightgray')
+            
+            # 绘制预设名称
+            display_name = preset_name[:10] + '...' if len(preset_name) > 10 else preset_name
+            if is_built_in:
+                display_name = f"📌{display_name}"
+            else:
+                display_name = f"✨{display_name}"
+            
+            if font:
+                bbox = draw.textbbox((0, 0), display_name, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+            else:
+                text_width = len(display_name) * 8
+                text_height = 16
+            
+            text_x = x + (cell_width - text_width) // 2
+            text_y = text_y_pos + (text_area_height - text_height) // 2
+            draw.text((text_x, text_y), display_name, fill='black', font=font)
+            
+            # 绘制单元格边框
+            draw.rectangle([x, y, x + cell_width, y + cell_height], outline='black', width=1)
+        
+        # 保存为字节
+        img_byte_arr = io.BytesIO()
+        table_img.save(img_byte_arr, format='PNG')
+        return img_byte_arr.getvalue()
 
     @filter.command("lm帮助", aliases={"lmh", "手办化帮助"}, prefix_optional=True)
     async def on_prompt_help(self, event: AstrMessageEvent):
@@ -1253,6 +1671,155 @@ class FigurineProPlugin(Star):
             self.daily_stats["groups"][gid] = current_g + 1
             
         await self._save_daily_stats()
+
+    async def _load_preset_images(self):
+        if not self.preset_images_file.exists():
+            self.preset_images = {}
+            return
+        try:
+            content = await asyncio.to_thread(self.preset_images_file.read_text, "utf-8")
+            self.preset_images = json.loads(content)
+        except:
+            self.preset_images = {}
+
+    async def _save_preset_images(self):
+        try:
+            data = json.dumps(self.preset_images, indent=4)
+            await asyncio.to_thread(self.preset_images_file.write_text, data, "utf-8")
+        except:
+            pass
+
+    async def _save_preset_image(self, preset_key: str, image_bytes: bytes):
+        """保存预设图片到文件和记录中"""
+        try:
+            # 生成文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{preset_key}_{timestamp}.png"
+            filepath = self.preset_images_dir / filename
+            
+            # 保存图片文件
+            await asyncio.to_thread(filepath.write_bytes, image_bytes)
+            
+            # 删除旧的图片文件（如果存在）
+            if preset_key in self.preset_images:
+                old_filename = self.preset_images[preset_key]
+                old_filepath = self.preset_images_dir / old_filename
+                if old_filepath.exists():
+                    await asyncio.to_thread(old_filepath.unlink)
+            
+            # 更新记录
+            self.preset_images[preset_key] = filename
+            await self._save_preset_images()
+            
+            logger.info(f"已保存预设图片: {preset_key} -> {filename}")
+            return True
+        except Exception as e:
+            logger.error(f"保存预设图片失败: {preset_key}, 错误: {e}")
+            return False
+
+    def _get_preset_image_path(self, preset_key: str) -> Optional[str]:
+        """获取预设图片的文件路径"""
+        if preset_key not in self.preset_images:
+            return None
+        
+        filename = self.preset_images[preset_key]
+        filepath = self.preset_images_dir / filename
+        
+        if filepath.exists():
+            return str(filepath)
+        else:
+            # 文件不存在，清理记录
+            del self.preset_images[preset_key]
+            asyncio.create_task(self._save_preset_images())
+            return None
+
+    async def _cleanup_preset_images(self, max_age_days: int = 30):
+        """清理超过指定天数的预设图片"""
+        try:
+            current_time = datetime.now()
+            cleaned_count = 0
+            
+            for preset_key, filename in list(self.preset_images.items()):
+                filepath = self.preset_images_dir / filename
+                if filepath.exists():
+                    # 获取文件创建时间
+                    file_time = datetime.fromtimestamp(filepath.stat().st_mtime)
+                    age_days = (current_time - file_time).days
+                    
+                    if age_days > max_age_days:
+                        # 删除文件和记录
+                        await asyncio.to_thread(filepath.unlink)
+                        del self.preset_images[preset_key]
+                        cleaned_count += 1
+                        logger.info(f"清理过期预设图片: {preset_key} ({filename})")
+            
+            if cleaned_count > 0:
+                await self._save_preset_images()
+                logger.info(f"预设图片清理完成，共清理 {cleaned_count} 个文件")
+            
+            return cleaned_count
+        except Exception as e:
+            logger.error(f"清理预设图片失败: {e}")
+            return 0
+
+    @filter.command("预设图片清理", prefix_optional=True)
+    async def on_cleanup_preset_images(self, event: AstrMessageEvent):
+        """清理过期的预设图片"""
+        if not self.is_global_admin(event):
+            yield event.plain_result("❌ 只有管理员可以执行此操作。")
+            return
+        
+        # 默认清理30天前的图片
+        max_age_days = 30
+        args = event.message_str.strip().split()
+        if len(args) > 1 and args[1].isdigit():
+            max_age_days = int(args[1])
+        
+        cleaned_count = await self._cleanup_preset_images(max_age_days)
+        
+        total_images = len(self.preset_images)
+        msg = f"✅ 预设图片清理完成！\n"
+        msg += f"📊 清理了 {cleaned_count} 个过期图片\n"
+        msg += f"📁 当前剩余 {total_images} 个预设图片\n"
+        msg += f"⏰ 清理条件: 超过 {max_age_days} 天的图片"
+        
+        yield event.plain_result(msg)
+
+    @filter.command("预设图片统计", prefix_optional=True)
+    async def on_preset_images_stats(self, event: AstrMessageEvent):
+        """显示预设图片统计信息"""
+        if not self.is_global_admin(event):
+            yield event.plain_result("❌ 只有管理员可以执行此操作。")
+            return
+        
+        total_images = len(self.preset_images)
+        
+        # 统计文件大小
+        total_size = 0
+        for filename in self.preset_images.values():
+            filepath = self.preset_images_dir / filename
+            if filepath.exists():
+                total_size += filepath.stat().st_size
+        
+        # 转换为MB
+        total_size_mb = total_size / (1024 * 1024)
+        
+        # 显示每个预设的图片信息
+        msg = f"📊 **预设图片统计**\n"
+        msg += f"==================\n"
+        msg += f"📁 总预设数: {total_images}\n"
+        msg += f"💾 总大小: {total_size_mb:.2f} MB\n"
+        msg += f"📂 存储目录: {self.preset_images_dir}\n\n"
+        
+        if total_images > 0:
+            msg += "📸 **详细列表**:\n"
+            for preset, filename in sorted(self.preset_images.items()):
+                filepath = self.preset_images_dir / filename
+                if filepath.exists():
+                    size_mb = filepath.stat().st_size / (1024 * 1024)
+                    msg += f"  • {preset}: {size_mb:.2f} MB\n"
+        
+        yield event.plain_result(msg)
 
     @filter.command("手办化今日统计", prefix_optional=True)
     async def get_daily_stats_report(self, event: AstrMessageEvent):
