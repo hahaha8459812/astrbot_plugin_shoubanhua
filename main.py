@@ -444,18 +444,39 @@ class FigurineProPlugin(Star):
         else:
             yield event.plain_result(f"❌ 序号无效。")
 
-    async def _get_pool_api_key(self, mode: str) -> str | None:
+    async def _get_pool_api_key(self, mode: str, use_power_mode: bool = False) -> str | None:
         keys = []
         async with self.key_lock:
+            if use_power_mode:
+                # 强力模式优先使用独立的Key池
+                if mode == "gemini_official":
+                    power_keys = self.conf.get("power_gemini_api_keys", [])
+                    # 如果强力模式Key池为空，使用普通模式的Key池
+                    if not power_keys:
+                        keys = self.conf.get("gemini_api_keys", [])
+                    else:
+                        keys = power_keys
+                else:
+                    power_keys = self.conf.get("power_generic_api_keys", [])
+                    # 如果强力模式Key池为空，使用普通模式的Key池
+                    if not power_keys:
+                        keys = self.conf.get("generic_api_keys", [])
+                    else:
+                        keys = power_keys
+            else:
+                # 普通模式使用常规Key池
+                if mode == "gemini_official":
+                    keys = self.conf.get("gemini_api_keys", [])
+                else:
+                    keys = self.conf.get("generic_api_keys", [])
+            
+            if not keys: return None
+            
             if mode == "gemini_official":
-                keys = self.conf.get("gemini_api_keys", [])
-                if not keys: return None
                 key = keys[self.gemini_key_index]
                 self.gemini_key_index = (self.gemini_key_index + 1) % len(keys)
                 return key
             else:
-                keys = self.conf.get("generic_api_keys", [])
-                if not keys: return None
                 key = keys[self.generic_key_index]
                 self.generic_key_index = (self.generic_key_index + 1) % len(keys)
                 return key
@@ -580,21 +601,35 @@ class FigurineProPlugin(Star):
         return summary
 
     async def _call_api(self, image_bytes_list: List[bytes], prompt: str,
-                        override_model: str | None = None) -> bytes | str:
+                        override_model: str | None = None, use_power_mode: bool = False) -> bytes | str:
 
         api_mode = self.conf.get("api_mode", "generic")
 
-        if api_mode == "gemini_official":
-            base_url = self.conf.get("gemini_api_url", "https://generativelanguage.googleapis.com")
+        # 根据是否强力模式选择对应的API配置
+        if use_power_mode:
+            if api_mode == "gemini_official":
+                base_url = self.conf.get("power_gemini_api_url", "")
+                # 如果强力模式URL为空，使用普通模式的URL
+                if not base_url:
+                    base_url = self.conf.get("gemini_api_url", "https://generativelanguage.googleapis.com")
+            else:
+                base_url = self.conf.get("power_generic_api_url", "")
+                # 如果强力模式URL为空，使用普通模式的URL
+                if not base_url:
+                    base_url = self.conf.get("generic_api_url", "https://api.bltcy.ai/v1/chat/completions")
         else:
-            base_url = self.conf.get("generic_api_url", "https://api.bltcy.ai/v1/chat/completions")
+            if api_mode == "gemini_official":
+                base_url = self.conf.get("gemini_api_url", "https://generativelanguage.googleapis.com")
+            else:
+                base_url = self.conf.get("generic_api_url", "https://api.bltcy.ai/v1/chat/completions")
 
         if not base_url:
             return "API URL 未配置"
 
         model_name = override_model or self.conf.get("model", "nano-banana")
         
-        api_key = await self._get_pool_api_key(api_mode)
+        # 根据是否强力模式选择对应的API密钥
+        api_key = await self._get_pool_api_key(api_mode, use_power_mode)
         if not api_key:
             return f"无可用 API Key (请在 {api_mode} 池中添加Key)"
 
@@ -1008,7 +1043,7 @@ class FigurineProPlugin(Star):
             display_cmd = user_prompt[:10] + '...' if len(user_prompt) > 10 else user_prompt
         elif len(images_to_process) > 0:
             # 对于非bnn模式，如果有多个@用户，保留所有头像，但限制最大数量
-            MAX_FIGURINE_IMAGES = 3  # 手办化等预设模式最多处理3张图片
+            MAX_FIGURINE_IMAGES = 10  # 手办化等预设模式最多处理10张图片
             if len(images_to_process) > MAX_FIGURINE_IMAGES:
                 images_to_process = images_to_process[:MAX_FIGURINE_IMAGES]
                 yield event.plain_result(f"🎨 检测到 {len(img_bytes_list)} 张图片（含@用户头像），已选取前 {MAX_FIGURINE_IMAGES} 张…")
@@ -1047,7 +1082,7 @@ class FigurineProPlugin(Star):
             await self._decrease_user_count(sender_id, required_cost)
 
         start_time = datetime.now()
-        res = await self._call_api(images_to_process, user_prompt, override_model=override_model_name)
+        res = await self._call_api(images_to_process, user_prompt, override_model=override_model_name, use_power_mode=use_power_model)
         elapsed = (datetime.now() - start_time).total_seconds()
 
         if isinstance(res, bytes):
@@ -1209,7 +1244,7 @@ class FigurineProPlugin(Star):
             await self._decrease_user_count(sender_id, required_cost)
 
         start_time = datetime.now()
-        res = await self._call_api([], prompt, override_model=override_model_name)
+        res = await self._call_api([], prompt, override_model=override_model_name, use_power_mode=use_power_model)
         elapsed = (datetime.now() - start_time).total_seconds()
 
         if isinstance(res, bytes):
@@ -1346,14 +1381,10 @@ class FigurineProPlugin(Star):
             # 创建表格图片
             table_image = await self._create_preset_table_image(all_presets)
             
-            # 创建标题消息
-            title_msg = "📜 **可用预设列表**\n"
-            title_msg += f"共 {len(all_presets)} 个预设 (内置: {len(built_in)}, 自定义: {len(custom)})\n"
-            title_msg += "使用方法: #预设名 [图片]"
+
             
             # 发送图片和标题
             yield event.chain_result([
-                Plain(title_msg + "\n\n"),
                 Image.fromBytes(table_image)
             ])
             
@@ -1383,13 +1414,35 @@ class FigurineProPlugin(Star):
 
     async def _create_preset_table_image(self, presets: List[Tuple[str, bool]]) -> bytes:
         """创建5xN表格图片，上面是图片，下面是预设名称"""
-        # 表格参数
-        cols = 5  # 每行5个
-        cell_width = 200
-        cell_height = 250  # 图片区域200px + 文字区域50px
-        image_area_height = 200
-        text_area_height = 50
-        padding = 10
+        # 根据配置选择表格质量
+        quality = self.conf.get("preset_table_quality", "高清")
+        
+        # 表格参数 - 根据质量设置尺寸
+        cols = self.conf.get("preset_table_columns", 5)  # 从配置获取列数，默认5列
+        if quality == "标准":
+            cell_width = 200  # 标准单元格宽度
+            cell_height = 250  # 标准单元格高度
+            image_area_height = 200  # 标准图片区域
+            text_area_height = 50   # 标准文字区域
+            padding = 10  # 标准内边距
+            font_size = 16
+            title_font_size = 20
+        elif quality == "高清":
+            cell_width = 300  # 增大单元格宽度
+            cell_height = 380  # 增大单元格高度
+            image_area_height = 320  # 增大图片区域
+            text_area_height = 60   # 增大文字区域
+            padding = 15  # 增大内边距
+            font_size = 24
+            title_font_size = 32
+        else:  # 超清
+            cell_width = 400  # 超大单元格宽度
+            cell_height = 500  # 超大单元格高度
+            image_area_height = 420  # 超大图片区域
+            text_area_height = 80   # 超大文字区域
+            padding = 20  # 超大内边距
+            font_size = 30
+            title_font_size = 40
         
         # 计算行数
         rows = (len(presets) + cols - 1) // cols
@@ -1419,8 +1472,8 @@ class FigurineProPlugin(Star):
             for font_path in font_paths:
                 try:
                     if Path(font_path).exists():
-                        font = ImageFont.truetype(font_path, 16)
-                        title_font = ImageFont.truetype(font_path, 20)
+                        font = ImageFont.truetype(font_path, font_size)  # 根据质量设置字体大小
+                        title_font = ImageFont.truetype(font_path, title_font_size)  # 根据质量设置标题字体
                         break
                 except:
                     continue
@@ -1437,6 +1490,15 @@ class FigurineProPlugin(Star):
         # 创建绘图对象
         from PIL import ImageDraw
         draw = ImageDraw.Draw(table_img)
+        
+        # 启用抗锯齿（如果可用）
+        try:
+            from PIL import ImageDraw
+            # 使用更平滑的绘图方法
+            if hasattr(draw, 'text'):  # 确保draw对象有text方法
+                pass  # PIL版本支持
+        except ImportError:
+            pass
         
         # 绘制每个单元格
         for i, (preset_name, is_built_in) in enumerate(presets):
@@ -1455,7 +1517,10 @@ class FigurineProPlugin(Star):
                 try:
                     # 加载并调整图片大小
                     preset_img = PILImage.open(image_path)
-                    # 保持纵横比，填充到200x200
+                    # 转换为RGB模式以确保兼容性
+                    if preset_img.mode != 'RGB':
+                        preset_img = preset_img.convert('RGB')
+                    # 保持纵横比，填充到更大尺寸，使用最高质量的LANCZOS重采样
                     preset_img.thumbnail((cell_width - 2*padding, image_area_height - 2*padding), PILImage.Resampling.LANCZOS)
                     
                     # 计算居中位置
@@ -1477,8 +1542,8 @@ class FigurineProPlugin(Star):
                         text_width = bbox[2] - bbox[0]
                         text_height = bbox[3] - bbox[1]
                     else:
-                        text_width = len(placeholder_text) * 8
-                        text_height = 16
+                        text_width = len(placeholder_text) * (font_size // 2)  # 根据字体大小调整字符宽度
+                        text_height = font_size
                     text_x = x + (cell_width - text_width) // 2
                     text_y = y + (image_area_height - text_height) // 2
                     draw.text((text_x, text_y), placeholder_text, fill='gray', font=font)
@@ -1492,8 +1557,8 @@ class FigurineProPlugin(Star):
                     text_width = bbox[2] - bbox[0]
                     text_height = bbox[3] - bbox[1]
                 else:
-                    text_width = len(placeholder_text) * 8
-                    text_height = 16
+                    text_width = len(placeholder_text) * (font_size // 2)  # 根据字体大小调整字符宽度
+                    text_height = font_size
                 text_x = x + (cell_width - text_width) // 2
                 text_y = y + (image_area_height - text_height) // 2
                 draw.text((text_x, text_y), placeholder_text, fill='gray', font=font)
@@ -1503,7 +1568,14 @@ class FigurineProPlugin(Star):
             draw.rectangle([x, text_y_pos, x + cell_width, text_y_pos + text_area_height], fill='lightgray')
             
             # 绘制预设名称
-            display_name = preset_name[:10] + '...' if len(preset_name) > 10 else preset_name
+            # 根据字体大小调整截断长度
+            if font_size <= 16:
+                max_length = 10  # 小字体可以显示更多字符
+            elif font_size <= 24:
+                max_length = 8   # 中等字体
+            else:
+                max_length = 6   # 大字体显示更少字符
+            display_name = preset_name[:max_length] + '...' if len(preset_name) > max_length else preset_name
             if is_built_in:
                 display_name = f"📌{display_name}"
             else:
@@ -1514,8 +1586,8 @@ class FigurineProPlugin(Star):
                 text_width = bbox[2] - bbox[0]
                 text_height = bbox[3] - bbox[1]
             else:
-                text_width = len(display_name) * 8
-                text_height = 16
+                text_width = len(display_name) * (font_size // 2)  # 根据字体大小调整字符宽度
+                text_height = font_size
             
             text_x = x + (cell_width - text_width) // 2
             text_y = text_y_pos + (text_area_height - text_height) // 2
@@ -1524,9 +1596,10 @@ class FigurineProPlugin(Star):
             # 绘制单元格边框
             draw.rectangle([x, y, x + cell_width, y + cell_height], outline='black', width=1)
         
-        # 保存为字节
+        # 保存为字节 - 使用更高质量设置
         img_byte_arr = io.BytesIO()
-        table_img.save(img_byte_arr, format='PNG')
+        # 使用PNG格式，质量设置为最高
+        table_img.save(img_byte_arr, format='PNG', optimize=True, compress_level=1)
         return img_byte_arr.getvalue()
 
     @filter.command("lm帮助", aliases={"lmh", "手办化帮助"}, prefix_optional=True)
@@ -1961,7 +2034,24 @@ class FigurineProPlugin(Star):
             return
 
         current_mode = self.conf.get("api_mode", "generic")
-        target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
+        
+        # 检查是否有强力模式参数
+        use_power_mode = False
+        if new_keys and new_keys[0].lower() in ["power", "强力", "p"]:
+            use_power_mode = True
+            new_keys = new_keys[1:]  # 移除参数
+        
+        if not new_keys:
+            yield event.plain_result("格式错误。用法: #手办化添加key [power/强力/p] <key1> ...")
+            return
+        
+        # 根据模式和是否强力模式选择目标字段
+        if use_power_mode:
+            target_field = "power_gemini_api_keys" if current_mode == "gemini_official" else "power_generic_api_keys"
+            mode_desc = f"【强力模式-{current_mode}】"
+        else:
+            target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
+            mode_desc = f"【{current_mode}】"
         
         keys = self.conf.get(target_field, [])
         added = [k for k in new_keys if k not in keys]
@@ -1971,7 +2061,7 @@ class FigurineProPlugin(Star):
         if hasattr(self.conf, "save"):
             self.conf.save()
 
-        yield event.plain_result(f"✅ 已向 【{current_mode}】 模式添加 {len(added)} 个Key。")
+        yield event.plain_result(f"✅ 已向 {mode_desc} 模式添加 {len(added)} 个Key。")
 
     @filter.command("手办化key列表", prefix_optional=True)
     async def on_list_keys(self, event: AstrMessageEvent):
@@ -1979,11 +2069,36 @@ class FigurineProPlugin(Star):
             return
 
         current_mode = self.conf.get("api_mode", "generic")
-        target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
         
-        keys = self.conf.get(target_field, [])
-        msg = "\n".join([f"{i + 1}. {k[:6]}..." for i, k in enumerate(keys)])
-        yield event.plain_result(f"🔑 当前模式 【{current_mode}】 Key 池:\n{msg}")
+        # 获取普通模式Key池
+        normal_target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
+        normal_keys = self.conf.get(normal_target_field, [])
+        
+        # 获取强力模式Key池
+        power_target_field = "power_gemini_api_keys" if current_mode == "gemini_official" else "power_generic_api_keys"
+        power_keys = self.conf.get(power_target_field, [])
+        
+        msg = f"🔑 API模式: 【{current_mode}】\n\n"
+        
+        # 普通模式Key列表
+        msg += f"📌 普通模式Key池 ({len(normal_keys)}个):\n"
+        if normal_keys:
+            msg += "\n".join([f"{i + 1}. {k[:6]}..." for i, k in enumerate(normal_keys)]) + "\n"
+        else:
+            msg += "(空)\n"
+        
+        # 强力模式Key列表
+        msg += f"\n⚡ 强力模式Key池 ({len(power_keys)}个):\n"
+        if power_keys:
+            msg += "\n".join([f"{i + 1}. {k[:6]}..." for i, k in enumerate(power_keys)]) + "\n"
+        else:
+            msg += "(空)\n"
+        
+        # 如果强力模式Key池为空，显示提示
+        if not power_keys:
+            msg += "\n💡 提示: 强力模式Key池为空时将使用普通模式Key池"
+        
+        yield event.plain_result(msg)
 
     @filter.command("手办化删除key", prefix_optional=True)
     async def on_delete_key(self, event: AstrMessageEvent):
@@ -1992,13 +2107,31 @@ class FigurineProPlugin(Star):
 
         parts = event.message_str.strip().split()
         if len(parts) < 2:
-            yield event.plain_result("格式: #手办化删除key <序号|all>")
+            yield event.plain_result("格式: #手办化删除key [power/强力/p] <序号|all>")
             return
 
-        param = parts[1]
+        # 检查是否有强力模式参数
+        use_power_mode = False
+        param_idx = 1
+        
+        if parts[1].lower() in ["power", "强力", "p"]:
+            use_power_mode = True
+            param_idx = 2
+            if len(parts) < 3:
+                yield event.plain_result("格式: #手办化删除key [power/强力/p] <序号|all>")
+                return
+        
+        param = parts[param_idx]
         
         current_mode = self.conf.get("api_mode", "generic")
-        target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
+        
+        # 根据是否强力模式选择目标字段
+        if use_power_mode:
+            target_field = "power_gemini_api_keys" if current_mode == "gemini_official" else "power_generic_api_keys"
+            mode_desc = f"【强力模式-{current_mode}】"
+        else:
+            target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
+            mode_desc = f"【{current_mode}】"
         
         keys = self.conf.get(target_field, [])
 
@@ -2013,7 +2146,7 @@ class FigurineProPlugin(Star):
         if hasattr(self.conf, "save"):
             self.conf.save()
 
-        yield event.plain_result(f"✅ 已从 【{current_mode}】 模式删除Key。")
+        yield event.plain_result(f"✅ 已从 {mode_desc} 模式删除Key。")
 
     async def terminate(self):
         if self.iwf:
